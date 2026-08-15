@@ -506,18 +506,15 @@ def i2c_tick():
                 rx_overflow = True
 
     elif state == STATE_REQUEST:
-        # Fill the hardware TX FIFO up to FIFO depth to prevent SCL
-        # clock-stretching timeouts. This is the latency-critical path —
-        # nothing here allocates or prints.
-        reply_len = len(reply)
-        for _ in range(I2C_TX_FIFO_BATCH):
-            if reply_index < reply_len:
-                slave.Slave_Write_Data(reply[reply_index])
-                reply_index += 1
-            else:
-                slave.Slave_Write_Data(0x00)
+        # Write exactly one byte for this read request so no unread bytes get trapped in TX FIFO
+        if reply_index < len(reply):
+            slave.Slave_Write_Data(reply[reply_index])
+            reply_index += 1
+        else:
+            slave.Slave_Write_Data(0x00)
 
     elif state == STATE_FINISH:
+        reply_index = 0
         if reply is adc_report and read_txn_start_us:
             dt = ticks_diff(ticks_us(), read_txn_start_us)
             if dt > read_txn_worst_us:
@@ -534,6 +531,7 @@ def i2c_tick():
             rx_len = 0
             rx_overflow = False
             safe_collect()  # bus is idle right here — our chosen GC point
+
 
 alloc_i2c_total = 0
 alloc_adc_total = 0
