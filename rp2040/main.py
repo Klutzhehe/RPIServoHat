@@ -535,20 +535,33 @@ def i2c_tick():
             rx_overflow = False
             safe_collect()  # bus is idle right here — our chosen GC point
 
+alloc_i2c_total = 0
+alloc_adc_total = 0
+alloc_other_total = 0
+
+
+def heartbeat():
+    global loop_worst_gap_us, read_txn_worst_us
+    global alloc_i2c_total, alloc_adc_total, alloc_other_total
+    free = gc.mem_free()
+    alloc = gc.mem_alloc()
+    print(
+        "[hb] free={} alloc={} | alloc_bytes: i2c={} adc={} other={} | writes ok={} | reads ok={} | gap_us={}".format(
+            free, alloc,
+            alloc_i2c_total, alloc_adc_total, alloc_other_total,
+            stats_writes_ok, stats_reads_ok,
+            loop_worst_gap_us,
+        )
+    )
+    alloc_i2c_total = 0
+    alloc_adc_total = 0
+    alloc_other_total = 0
+    loop_worst_gap_us = 0
+    read_txn_worst_us = 0
+
 
 try:
     print("RP2040 servo slave ready (debug build): I2C0 GP20/GP21, address 0x2A")
-
-    # Test allocation of 1000 passes of i2c_tick vs adc_scan_tick
-    gc.collect()
-    _m0 = gc.mem_alloc()
-    for _ in range(1000):
-        i2c_tick()
-    _m1 = gc.mem_alloc()
-    for _ in range(1000):
-        adc_scan_tick()
-    _m2 = gc.mem_alloc()
-    print("[diag] RAM allocated per 1000 i2c_ticks: {} bytes | per 1000 adc_ticks: {} bytes".format(_m1 - _m0, _m2 - _m1))
 
     while True:
         now = ticks_us()
@@ -557,12 +570,16 @@ try:
             loop_worst_gap_us = gap
         loop_last_tick_us = now
 
+        _a0 = gc.mem_alloc()
         try:
             i2c_tick()
         except Exception as e:
             stats_i2c_exceptions += 1
             print("!! i2c_tick exception:")
             sys.print_exception(e)
+        _a1 = gc.mem_alloc()
+        if _a1 > _a0:
+            alloc_i2c_total += (_a1 - _a0)
 
         try:
             adc_scan_tick()
@@ -570,6 +587,9 @@ try:
             stats_adc_exceptions += 1
             print("!! adc_scan_tick exception:")
             sys.print_exception(e)
+        _a2 = gc.mem_alloc()
+        if _a2 > _a1:
+            alloc_adc_total += (_a2 - _a1)
 
         if ticks_diff(ticks_ms(), last_heartbeat_ms) >= HEARTBEAT_MS:
             heartbeat()
