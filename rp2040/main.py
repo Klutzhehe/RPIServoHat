@@ -1,21 +1,55 @@
-"""22-servo RP2040 MicroPython I2C slave application.
+"""22-servo RP2040 MicroPython I2C slave application — DEBUG BUILD.
 
-This replaces the demo main.py from ifurusato/rp2040-i2c-slave.  Keep that
-project's rp2040_slave.py, RP2040_I2C_Registers.py, and core/ folder on the
-RP2040; this file uses its low-level I2C slave driver directly.
+Same protocol/behavior as main.py, but instrumented to chase down the
+read-path failures (I/O error right after reset, timeouts after ~1-2 min):
 
-I2C: I2C0, GP20=SDA, GP21=SCL, slave address 0x2A, 100 kHz maximum.
-Servo outputs: S0..S19=GP0..GP19, S20=GP22, S21=GP23.
+  - rx_buffer is pre-allocated once (no per-transaction bytearray alloc,
+    which was the leading suspect for GC pauses landing mid-transaction)
+  - automatic GC is disabled; collection only runs at a chosen bus-idle
+    point (right after a write transaction finishes)
+  - i2c_tick() / adc_scan_tick() are each wrapped so an exception gets
+    printed with a full traceback instead of silently killing the whole
+    slave loop (which would explain a later hard timeout)
+  - lightweight counters/timers track: write/read counts, RX overflow
+    and invalid-packet counts, GC pause duration, worst-case main-loop
+    iteration gap, and worst-case duration of a full read transaction
+  - NOTHING above prints from inside a live transaction. All output is
+    either a rare exception print, or one heartbeat line every
+    HEARTBEAT_MS from the idle main loop. Printing over USB serial is
+    itself slow enough to make clock-stretching worse, so the hot path
+    (I2C_RECEIVE / I2C_REQUEST) never touches print().
+
+How to use:
+  1. Copy this over rp2040/main.py (keep the original as a backup).
+  2. Connect Thonny (or any serial terminal) to the Pico's REPL so you
+     can watch the console live.
+  3. From the Pi, run your normal `read` / `monitor` test through a
+     failure, exactly as before.
+  4. Watch the heartbeat lines. Things to look for:
+       - free/alloc trending down then jumping back up = GC activity;
+         correlate the jump timing against when the Pi-side call fails.
+       - gc worst_us growing large = a collection that took a long time
+         (long collections are more likely to land inside a request).
+       - loop worst_gap_us spiking = something (not necessarily GC) is
+         blocking the main loop for a while.
+       - read_txn worst_us growing large or a read transaction that
+         never reaches I2C_FINISH (reads ok stops incrementing while
+         writes ok keeps climbing) = the RP2040 is stalling specifically
+         mid-read, which is the read-path clock-stretch theory.
+       - any "!! i2c_tick exception" or "!! adc_scan_tick exception"
+         line = the firmware actually crashed/recovered there; if the
+         loop stops producing heartbeats entirely after one of these,
+         the slave loop died for good, which is the "firmware silently
+         dying" theory instead.
 """
 
-from machine import ADC, PWM, Pin
-from time import ticks_add, ticks_diff, ticks_us
-
-from rp2040_slave import RP2040_Slave
-
+from machine import ADC, PWM, Pin, mem32
+from time import ticks_add, ticks_diff, ticks_us, ticks_ms
+import gc
+import sys
 
 # ---------------------------------------------------------------------------
-# Hardware configuration
+# Hardware configuration (unchanged from main.py)
 # ---------------------------------------------------------------------------
 I2C_BUS_ID = 0
 I2C_ADDRESS = 0x2A
@@ -26,8 +60,8 @@ SERVO_GPIOS = tuple(range(20)) + (22, 23)
 SERVO_COUNT = len(SERVO_GPIOS)
 SERVO_MIN_US = 1000
 SERVO_MAX_US = 2000
-SERVO_START_US = 1000       # Safe position used at boot and by CMD_SAFE.
-SERVO_PERIOD_US = 20000     # 50 Hz
+SERVO_START_US = 1000  # Safe position used at boot and by CMD_SAFE.
+SERVO_PERIOD_US = 20000  # 50 Hz
 
 MUX_A0 = Pin(24, Pin.OUT)
 MUX_A1 = Pin(25, Pin.OUT)
@@ -41,19 +75,19 @@ MUX_SETTLE_US = 10000
 # current-sense ADC in the supplied board mapping.
 ADC_SERVO_MAP = (4, 1, 3, 2, 9, 6, 8, 7, 14, 11, 13, 12, 19, 16, 18, 17)
 
-
 # ---------------------------------------------------------------------------
-# Binary protocol (Raspberry Pi master -> RP2040 slave)
+# Binary protocol (unchanged)
 # ---------------------------------------------------------------------------
-CMD_SET_SERVO = 0x01        # [0x01, servo 0..21, pulse_us_hi, pulse_us_lo]
-CMD_SET_ALL = 0x02          # [0x02, pulse_us_hi, pulse_us_lo]
-CMD_SAFE = 0x03             # [0x03] -> 1000 us on every servo
+CMD_SET_SERVO = 0x01  # [0x01, servo 0..21, pulse_us_hi, pulse_us_lo]
+CMD_SET_ALL = 0x02    # [0x02, pulse_us_hi, pulse_us_lo]
+CMD_SAFE = 0x03        # [0x03] -> 1000 us on every servo
 CMD_READ_ADC_REPORT = 0x10  # [0x10], then master reads 36 bytes
 
 REPORT_MAGIC = 0xA5
 REPORT_VERSION = 0x01
-REPORT_SIZE = 36             # magic, version, sequence, count, 16 x uint16
-I2C_TX_FIFO_BATCH = 16       # Fill up to the RP2040 hardware I2C FIFO capacity
+REPORT_SIZE = 36  # magic, version, sequence, count, 16 x uint16
+
+I2C_TX_FIFO_BATCH = 16  # Fill up to the RP2040 hardware I2C FIFO capacity
 
 # Pre-allocated report buffer to avoid runtime GC allocations
 adc_report = bytearray(REPORT_SIZE)
@@ -100,11 +134,9 @@ def set_all_servos(pulse_us):
 
 
 # ---------------------------------------------------------------------------
-# Incremental current-sense scan
-#
-# Do not scan all 16 channels in one blocking operation. The RP2040 is an I2C
-# slave, so it must return quickly to service the Pi. One ADC sample is taken
-# per main-loop pass, while the mux gets its full 10 ms settle time.
+# Incremental current-sense scan (unchanged — already non-blocking/allocation
+# free per call, so it wasn't the leading suspect, but it's left instrumented
+# via the exception guard in the main loop below just in case).
 # ---------------------------------------------------------------------------
 adc_raw = [0] * 16
 adc_sequence = 0
@@ -146,7 +178,6 @@ def adc_scan_tick():
     idx = scan_adc * 4 + scan_mux
     adc_raw[idx] = avg_sample
 
-    # Update pre-allocated report buffer in place (zero-allocation)
     offset = 4 + (idx * 2)
     adc_report[offset] = (avg_sample >> 8) & 0xFF
     adc_report[offset + 1] = avg_sample & 0xFF
@@ -154,7 +185,6 @@ def adc_scan_tick():
     sample_sum = 0
     sample_count = 0
     scan_adc += 1
-
     if scan_adc < 4:
         return
 
@@ -164,25 +194,249 @@ def adc_scan_tick():
         scan_mux = 0
         adc_sequence = (adc_sequence + 1) & 0xFF
         adc_report[2] = adc_sequence
+
     select_mux(scan_mux)
     next_adc_sample_at = ticks_add(ticks_us(), MUX_SETTLE_US)
 
 
 start_scan()
 
+# ---------------------------------------------------------------------------
+# Debug instrumentation — no printing inside a live transaction, see notes
+# at the top of the file.
+# ---------------------------------------------------------------------------
+HEARTBEAT_MS = 2000
+
+import micropython
+
+micropython.alloc_emergency_exception_buf(100)
+gc.enable()  # Ensure MicroPython automatic GC is active
+
+stats_writes_ok = 0
+stats_writes_bad = 0
+stats_reads_ok = 0
+stats_overflow = 0
+stats_invalid_packet = 0
+stats_gc_collections = 0
+stats_gc_last_freed = 0
+stats_gc_worst_us = 0
+stats_i2c_exceptions = 0
+stats_adc_exceptions = 0
+
+loop_last_tick_us = ticks_us()
+loop_worst_gap_us = 0
+
+read_txn_start_us = 0
+read_txn_worst_us = 0
+
+last_heartbeat_ms = ticks_ms()
+
+
+def heartbeat():
+    global loop_worst_gap_us, read_txn_worst_us
+    free = gc.mem_free()
+    alloc = gc.mem_alloc()
+    print(
+        "[hb] free={} alloc={} | writes ok={} bad={} | reads ok={} | "
+        "overflow={} invalid={} | gc n={} last_freed={} worst_us={} | "
+        "loop worst_gap_us={} | read_txn worst_us={} | exc i2c={} adc={}".format(
+            free, alloc,
+            stats_writes_ok, stats_writes_bad,
+            stats_reads_ok,
+            stats_overflow, stats_invalid_packet,
+            stats_gc_collections, stats_gc_last_freed, stats_gc_worst_us,
+            loop_worst_gap_us,
+            read_txn_worst_us,
+            stats_i2c_exceptions, stats_adc_exceptions,
+        )
+    )
+    loop_worst_gap_us = 0
+    read_txn_worst_us = 0
+
+
+def safe_collect():
+    """Run GC at a point we know the bus is idle (right after a write
+    transaction finishes), and time how long it took."""
+    global stats_gc_collections, stats_gc_last_freed, stats_gc_worst_us
+    before = gc.mem_free()
+    t0 = ticks_us()
+    gc.collect()
+    dt = ticks_diff(ticks_us(), t0)
+    after = gc.mem_free()
+    stats_gc_collections += 1
+    stats_gc_last_freed = after - before
+    if dt > stats_gc_worst_us:
+        stats_gc_worst_us = dt
+
 
 # ---------------------------------------------------------------------------
-# I2C slave transport. RP2040_Slave is supplied by the library you installed.
+# Self-contained Zero-Allocation RP2040 I2C Slave Driver
 # ---------------------------------------------------------------------------
-slave = RP2040_Slave(
+IO_BANK0_BASE = 0x40014000
+I2C0_BASE     = 0x40044000
+I2C1_BASE     = 0x40048000
+
+MEM_RW  = 0x0000
+MEM_XOR = 0x1000
+MEM_SET = 0x2000
+MEM_CLR = 0x3000
+
+IC_CON             = 0x00
+IC_TAR             = 0x04
+IC_SAR             = 0x08
+IC_DATA_CMD        = 0x10
+IC_INTR_STAT       = 0x2C
+IC_INTR_MASK       = 0x30
+IC_RAW_INTR_STAT   = 0x34
+IC_CLR_INTR        = 0x40
+IC_CLR_RX_UNDER    = 0x44
+IC_CLR_RX_OVER     = 0x48
+IC_CLR_TX_OVER     = 0x4C
+IC_CLR_RD_REQ      = 0x50
+IC_CLR_TX_ABRT     = 0x54
+IC_CLR_RX_DONE     = 0x58
+IC_CLR_ACTIVITY    = 0x5C
+IC_CLR_STOP_DET    = 0x60
+IC_CLR_START_DET   = 0x64
+IC_CLR_GEN_CALL    = 0x68
+IC_ENABLE          = 0x6C
+IC_STATUS          = 0x70
+IC_TXFLR           = 0x74
+IC_RXFLR           = 0x78
+IC_CLR_RESTART_DET = 0xA8
+
+INTR_RX_UNDER    = 0x0001
+INTR_RX_OVER     = 0x0002
+INTR_RX_FULL     = 0x0004
+INTR_TX_OVER     = 0x0008
+INTR_TX_EMPTY    = 0x0010
+INTR_RD_REQ      = 0x0020
+INTR_TX_ABRT     = 0x0040
+INTR_RX_DONE     = 0x0080
+INTR_ACTIVITY    = 0x0100
+INTR_STOP_DET    = 0x0200
+INTR_START_DET   = 0x0400
+INTR_GEN_CALL    = 0x0800
+INTR_RESTART_DET = 0x1000
+
+STATUS_ACTIVITY  = 0x01
+STATUS_TFNF      = 0x02  # TX FIFO Not Full
+STATUS_TFE       = 0x04  # TX FIFO Empty
+STATUS_RFNE      = 0x08  # RX FIFO Not Empty
+STATUS_RFF       = 0x10  # RX FIFO Full
+
+STATE_RECEIVE = 0
+STATE_REQUEST = 1
+STATE_FINISH  = 2
+STATE_START   = 3
+
+
+class RP2040_Slave_Driver:
+    class I2CStateMachine:
+        I2C_RECEIVE = STATE_RECEIVE
+        I2C_REQUEST = STATE_REQUEST
+        I2C_FINISH  = STATE_FINISH
+        I2C_START   = STATE_START
+
+    def __init__(self, i2c_id=0, sda=20, scl=21, i2c_address=0x2A):
+        self._scl = scl
+        self._sda = sda
+        self._i2c_address = i2c_address
+        self._i2c_base = I2C0_BASE if i2c_id == 0 else I2C1_BASE
+
+        # 1. Disable the I2C controller
+        mem32[self._i2c_base | MEM_CLR | IC_ENABLE] = 0x01
+
+        # 2. Set slave address in IC_SAR (bits 9:0)
+        mem32[self._i2c_base | MEM_CLR | IC_SAR] = 0x03FF
+        mem32[self._i2c_base | MEM_SET | IC_SAR] = self._i2c_address & 0x03FF
+
+        # 3. Configure IC_CON: 7-bit slave mode, slave enabled, master disabled, clock stretching enabled
+        mem32[self._i2c_base | MEM_CLR | IC_CON] = 0x0041
+        mem32[self._i2c_base | MEM_SET | IC_CON] = 0x0200
+
+        # 4. Enable I2C controller
+        mem32[self._i2c_base | MEM_SET | IC_ENABLE] = 0x01
+
+        # 5. Clear all pending interrupts initially
+        _ = mem32[self._i2c_base | IC_CLR_INTR]
+
+        # 6. Configure GPIO pins for I2C (Function 3 = I2C)
+        mem32[IO_BANK0_BASE | MEM_CLR | (4 + 8 * self._sda)] = 0x1F
+        mem32[IO_BANK0_BASE | MEM_SET | (4 + 8 * self._sda)] = 0x03
+
+        mem32[IO_BANK0_BASE | MEM_CLR | (4 + 8 * self._scl)] = 0x1F
+        mem32[IO_BANK0_BASE | MEM_SET | (4 + 8 * self._scl)] = 0x03
+
+    def handle_event(self):
+        """Poll and service hardware I2C events with 0 allocations."""
+        base = self._i2c_base
+        intr = mem32[base | IC_INTR_STAT]
+        status = mem32[base | IC_STATUS]
+
+        # 1. PRIORITY: If RX FIFO has data, service it FIRST before STOP
+        if status & STATUS_RFNE:
+            return STATE_RECEIVE
+
+        # 2. Master is requesting data (Read Request)
+        if intr & INTR_RD_REQ:
+            return STATE_REQUEST
+
+        # 3. Master aborted transaction
+        if intr & INTR_TX_ABRT:
+            _ = mem32[base | IC_CLR_TX_ABRT]
+            return STATE_FINISH
+
+        # 4. Master finished reading
+        if intr & INTR_RX_DONE:
+            _ = mem32[base | IC_CLR_RX_DONE]
+            return STATE_FINISH
+
+        # 5. Stop condition detected
+        if intr & INTR_STOP_DET:
+            _ = mem32[base | IC_CLR_STOP_DET]
+            return STATE_FINISH
+
+        # 6. Start condition detected
+        if intr & INTR_START_DET:
+            _ = mem32[base | IC_CLR_START_DET]
+            return STATE_START
+
+        # 7. Restart condition detected
+        if intr & INTR_RESTART_DET:
+            _ = mem32[base | IC_CLR_RESTART_DET]
+            return STATE_START
+
+        # 8. Clear overflow errors
+        if intr & (INTR_RX_OVER | INTR_TX_OVER | INTR_RX_UNDER):
+            _ = mem32[base | IC_CLR_INTR]
+
+        return None
+
+    def Available(self):
+        return bool(mem32[self._i2c_base | IC_STATUS] & STATUS_RFNE)
+
+    def Read_Data_Received(self):
+        return mem32[self._i2c_base | IC_DATA_CMD] & 0xFF
+
+    def Slave_Write_Data(self, data):
+        base = self._i2c_base
+        mem32[base | IC_DATA_CMD] = data & 0xFF
+        _ = mem32[base | IC_CLR_RD_REQ]
+
+
+slave = RP2040_Slave_Driver(
     i2c_id=I2C_BUS_ID,
     sda=I2C_SDA_PIN,
     scl=I2C_SCL_PIN,
     i2c_address=I2C_ADDRESS,
 )
 
-rx_buffer = bytearray()
+MAX_RX_LEN = 4
+rx_buffer = bytearray(MAX_RX_LEN)  # pre-allocated once, no per-txn alloc
+rx_len = 0
 rx_overflow = False
+
 reply_ok = bytearray((0x00,))
 reply_err = bytearray((0xEE,))
 reply = reply_err
@@ -195,59 +449,131 @@ def set_reply(data):
     reply_index = 0
 
 
-def process_command(packet):
-    if len(packet) == 4 and packet[0] == CMD_SET_SERVO:
-        pulse_us = (packet[2] << 8) | packet[3]
-        set_reply(reply_ok if set_servo(packet[1], pulse_us) else reply_err)
-    elif len(packet) == 3 and packet[0] == CMD_SET_ALL:
-        set_all_servos((packet[1] << 8) | packet[2])
+def process_command(length):
+    global stats_writes_ok, stats_writes_bad, stats_invalid_packet
+
+    cmd = rx_buffer[0]
+
+    if length == 4 and cmd == CMD_SET_SERVO:
+        pulse_us = (rx_buffer[2] << 8) | rx_buffer[3]
+        ok = set_servo(rx_buffer[1], pulse_us)
+        set_reply(reply_ok if ok else reply_err)
+        if ok:
+            stats_writes_ok += 1
+        else:
+            stats_writes_bad += 1
+
+    elif length == 3 and cmd == CMD_SET_ALL:
+        set_all_servos((rx_buffer[1] << 8) | rx_buffer[2])
         set_reply(reply_ok)
-    elif len(packet) == 1 and packet[0] == CMD_SAFE:
+        stats_writes_ok += 1
+
+    elif length == 1 and cmd == CMD_SAFE:
         set_all_servos(SERVO_START_US)
         set_reply(reply_ok)
-    elif len(packet) == 1 and packet[0] == CMD_READ_ADC_REPORT:
+        stats_writes_ok += 1
+
+    elif length == 1 and cmd == CMD_READ_ADC_REPORT:
         set_reply(adc_report)
+        # stats_reads_ok is incremented when the matching read transaction
+        # actually reaches I2C_FINISH, not here — this only stages the reply.
+
     else:
         set_reply(reply_err)
+        stats_invalid_packet += 1
 
 
 def i2c_tick():
-    """Service at most the currently pending I2C event; never block here."""
-    global rx_buffer, rx_overflow, reply_index
+    global rx_len, rx_overflow, reply_index
+    global stats_overflow, stats_reads_ok
+    global read_txn_start_us, read_txn_worst_us
 
     state = slave.handle_event()
-    if state == slave.I2CStateMachine.I2C_START:
-        # A new master read begins at byte zero of the prepared response.
+
+    if state == STATE_START:
         reply_index = 0
-    elif state == slave.I2CStateMachine.I2C_RECEIVE:
+        if reply is adc_report:
+            # A read of the previously-staged ADC report is starting now.
+            read_txn_start_us = ticks_us()
+
+    elif state == STATE_RECEIVE:
         while slave.Available():
             received = slave.Read_Data_Received()
-            if len(rx_buffer) < 4:
-                rx_buffer.append(received)
+            if rx_len < MAX_RX_LEN:
+                rx_buffer[rx_len] = received
+                rx_len += 1
             else:
                 rx_overflow = True
-    elif state == slave.I2CStateMachine.I2C_REQUEST:
-        # Fill the hardware TX FIFO up to FIFO depth to prevent SCL clock-stretching timeouts
+
+    elif state == STATE_REQUEST:
+        # Fill the hardware TX FIFO up to FIFO depth to prevent SCL
+        # clock-stretching timeouts. This is the latency-critical path —
+        # nothing here allocates or prints.
+        reply_len = len(reply)
         for _ in range(I2C_TX_FIFO_BATCH):
-            if reply_index < len(reply):
+            if reply_index < reply_len:
                 slave.Slave_Write_Data(reply[reply_index])
                 reply_index += 1
             else:
                 slave.Slave_Write_Data(0x00)
-    elif state == slave.I2CStateMachine.I2C_FINISH:
-        if rx_buffer:
+
+    elif state == STATE_FINISH:
+        if reply is adc_report and read_txn_start_us:
+            dt = ticks_diff(ticks_us(), read_txn_start_us)
+            if dt > read_txn_worst_us:
+                read_txn_worst_us = dt
+            stats_reads_ok += 1
+            read_txn_start_us = 0
+
+        if rx_len:
             if rx_overflow:
                 set_reply(reply_err)
+                stats_overflow += 1
             else:
-                process_command(rx_buffer)
-        rx_buffer = bytearray()
-        rx_overflow = False
+                process_command(rx_len)
+            rx_len = 0
+            rx_overflow = False
+            safe_collect()  # bus is idle right here — our chosen GC point
 
 
 try:
-    print("RP2040 servo slave ready: I2C0 GP20/GP21, address 0x2A")
-    while True:
+    print("RP2040 servo slave ready (debug build): I2C0 GP20/GP21, address 0x2A")
+
+    # Test allocation of 1000 passes of i2c_tick vs adc_scan_tick
+    gc.collect()
+    _m0 = gc.mem_alloc()
+    for _ in range(1000):
         i2c_tick()
+    _m1 = gc.mem_alloc()
+    for _ in range(1000):
         adc_scan_tick()
+    _m2 = gc.mem_alloc()
+    print("[diag] RAM allocated per 1000 i2c_ticks: {} bytes | per 1000 adc_ticks: {} bytes".format(_m1 - _m0, _m2 - _m1))
+
+    while True:
+        now = ticks_us()
+        gap = ticks_diff(now, loop_last_tick_us)
+        if gap > loop_worst_gap_us:
+            loop_worst_gap_us = gap
+        loop_last_tick_us = now
+
+        try:
+            i2c_tick()
+        except Exception as e:
+            stats_i2c_exceptions += 1
+            print("!! i2c_tick exception:")
+            sys.print_exception(e)
+
+        try:
+            adc_scan_tick()
+        except Exception as e:
+            stats_adc_exceptions += 1
+            print("!! adc_scan_tick exception:")
+            sys.print_exception(e)
+
+        if ticks_diff(ticks_ms(), last_heartbeat_ms) >= HEARTBEAT_MS:
+            heartbeat()
+            last_heartbeat_ms = ticks_ms()
+
 except KeyboardInterrupt:
     print("RP2040 slave stopped.")
