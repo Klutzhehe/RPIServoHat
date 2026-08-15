@@ -127,12 +127,13 @@ def apply_pwm(servo_number, pulse_us):
         SERVOS[servo_number] = pwm
 
 
+# Populate target report buffer without eagerly claiming colliding PWM slices at boot
 for i in range(SERVO_COUNT):
     p = servo_targets[i]
-    apply_pwm(i, p)
     offset = 4 + i * 2
     targets_report[offset] = (p >> 8) & 0xFF
     targets_report[offset + 1] = p & 0xFF
+
 
 
 def set_servo(servo_number, pulse_us):
