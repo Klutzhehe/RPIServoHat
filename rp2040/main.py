@@ -1,55 +1,21 @@
-"""22-servo RP2040 MicroPython I2C slave application — DEBUG BUILD.
+"""22-servo RP2040 MicroPython I2C slave application.
 
-Same protocol/behavior as main.py, but instrumented to chase down the
-read-path failures (I/O error right after reset, timeouts after ~1-2 min):
-
-  - rx_buffer is pre-allocated once (no per-transaction bytearray alloc,
-    which was the leading suspect for GC pauses landing mid-transaction)
-  - automatic GC is disabled; collection only runs at a chosen bus-idle
-    point (right after a write transaction finishes)
-  - i2c_tick() / adc_scan_tick() are each wrapped so an exception gets
-    printed with a full traceback instead of silently killing the whole
-    slave loop (which would explain a later hard timeout)
-  - lightweight counters/timers track: write/read counts, RX overflow
-    and invalid-packet counts, GC pause duration, worst-case main-loop
-    iteration gap, and worst-case duration of a full read transaction
-  - NOTHING above prints from inside a live transaction. All output is
-    either a rare exception print, or one heartbeat line every
-    HEARTBEAT_MS from the idle main loop. Printing over USB serial is
-    itself slow enough to make clock-stretching worse, so the hot path
-    (I2C_RECEIVE / I2C_REQUEST) never touches print().
-
-How to use:
-  1. Copy this over rp2040/main.py (keep the original as a backup).
-  2. Connect Thonny (or any serial terminal) to the Pico's REPL so you
-     can watch the console live.
-  3. From the Pi, run your normal `read` / `monitor` test through a
-     failure, exactly as before.
-  4. Watch the heartbeat lines. Things to look for:
-       - free/alloc trending down then jumping back up = GC activity;
-         correlate the jump timing against when the Pi-side call fails.
-       - gc worst_us growing large = a collection that took a long time
-         (long collections are more likely to land inside a request).
-       - loop worst_gap_us spiking = something (not necessarily GC) is
-         blocking the main loop for a while.
-       - read_txn worst_us growing large or a read transaction that
-         never reaches I2C_FINISH (reads ok stops incrementing while
-         writes ok keeps climbing) = the RP2040 is stalling specifically
-         mid-read, which is the read-path clock-stretch theory.
-       - any "!! i2c_tick exception" or "!! adc_scan_tick exception"
-         line = the firmware actually crashed/recovered there; if the
-         loop stops producing heartbeats entirely after one of these,
-         the slave loop died for good, which is the "firmware silently
-         dying" theory instead.
+High-performance, zero-allocation implementation for Raspberry Pi master communication:
+  - 22 PWM servo outputs: S0..S19=GP0..GP19, S20=GP22, S21=GP23
+  - Configurable startup angle table for all 22 servos (default 90 deg / 1500 us)
+  - Live target pulse/angle tracking
+  - High-speed I2C slave driver embedded with zero runtime GC allocation
+  - Fast ADC current multiplexer scan loop (100 us settle)
+  - Command 0x10: 36-byte current-sense ADC report (Magic 0xA5)
+  - Command 0x11: 48-byte servo target pulse/angle report (Magic 0xB5)
 """
 
 from machine import ADC, PWM, Pin, mem32
 from time import ticks_add, ticks_diff, ticks_us, ticks_ms
 import gc
-import sys
 
 # ---------------------------------------------------------------------------
-# Hardware configuration (unchanged from main.py)
+# Hardware configuration
 # ---------------------------------------------------------------------------
 I2C_BUS_ID = 0
 I2C_ADDRESS = 0x2A
@@ -60,41 +26,52 @@ SERVO_GPIOS = tuple(range(20)) + (22, 23)
 SERVO_COUNT = len(SERVO_GPIOS)
 SERVO_MIN_US = 1000
 SERVO_MAX_US = 2000
-SERVO_START_US = 1000  # Safe position used at boot and by CMD_SAFE.
 SERVO_PERIOD_US = 20000  # 50 Hz
+
+# Configurable starting angle for each servo (S0..S21) in degrees (0..180)
+# Default is 90 degrees (1500 us neutral position). Customize per servo as needed:
+SERVO_START_ANGLES = (90,) * SERVO_COUNT
 
 MUX_A0 = Pin(24, Pin.OUT)
 MUX_A1 = Pin(25, Pin.OUT)
-ADC_PINS = (29, 28, 27, 26)  # Same ordering as the original debug program.
+ADC_PINS = (29, 28, 27, 26)
 ADCS = tuple(ADC(pin) for pin in ADC_PINS)
-ADC_SAMPLES = 8
-ADC_SAMPLE_GAP_US = 100
-MUX_SETTLE_US = 10000
+ADC_SAMPLES = 4
+ADC_SAMPLE_GAP_US = 20
+MUX_SETTLE_US = 100  # 100 µs settle time for fast telemetry refresh
 
-# The report uses this order. S0, S5, S10, S15, S20, and S21 have no routed
-# current-sense ADC in the supplied board mapping.
+# 16 routed current-sense ADC mapping
 ADC_SERVO_MAP = (4, 1, 3, 2, 9, 6, 8, 7, 14, 11, 13, 12, 19, 16, 18, 17)
 
 # ---------------------------------------------------------------------------
-# Binary protocol (unchanged)
+# Binary protocol (Raspberry Pi master -> RP2040 slave)
 # ---------------------------------------------------------------------------
-CMD_SET_SERVO = 0x01  # [0x01, servo 0..21, pulse_us_hi, pulse_us_lo]
-CMD_SET_ALL = 0x02    # [0x02, pulse_us_hi, pulse_us_lo]
-CMD_SAFE = 0x03        # [0x03] -> 1000 us on every servo
-CMD_READ_ADC_REPORT = 0x10  # [0x10], then master reads 36 bytes
+CMD_SET_SERVO = 0x01          # [0x01, servo 0..21, pulse_us_hi, pulse_us_lo]
+CMD_SET_ALL = 0x02            # [0x02, pulse_us_hi, pulse_us_lo]
+CMD_SAFE = 0x03               # [0x03] -> return all servos to starting angles
+CMD_READ_ADC_REPORT = 0x10    # [0x10], then master reads 36-byte ADC report
+CMD_READ_TARGET_REPORT = 0x11 # [0x11], then master reads 48-byte target report
 
-REPORT_MAGIC = 0xA5
-REPORT_VERSION = 0x01
-REPORT_SIZE = 36  # magic, version, sequence, count, 16 x uint16
+ADC_REPORT_MAGIC = 0xA5
+ADC_REPORT_VERSION = 0x01
+ADC_REPORT_SIZE = 36          # magic (1), ver (1), seq (1), count (1), 16 x uint16 (32)
 
-I2C_TX_FIFO_BATCH = 16  # Fill up to the RP2040 hardware I2C FIFO capacity
+TARGETS_REPORT_MAGIC = 0xB5
+TARGETS_REPORT_VERSION = 0x01
+TARGETS_REPORT_SIZE = 48       # magic (1), ver (1), count (1), res (1), 22 x uint16 (44)
 
-# Pre-allocated report buffer to avoid runtime GC allocations
-adc_report = bytearray(REPORT_SIZE)
-adc_report[0] = REPORT_MAGIC
-adc_report[1] = REPORT_VERSION
+# Pre-allocated zero-allocation telemetry reports
+adc_report = bytearray(ADC_REPORT_SIZE)
+adc_report[0] = ADC_REPORT_MAGIC
+adc_report[1] = ADC_REPORT_VERSION
 adc_report[2] = 0
 adc_report[3] = 16
+
+targets_report = bytearray(TARGETS_REPORT_SIZE)
+targets_report[0] = TARGETS_REPORT_MAGIC
+targets_report[1] = TARGETS_REPORT_VERSION
+targets_report[2] = SERVO_COUNT
+targets_report[3] = 0x00
 
 
 def clamp_pulse(pulse_us):
@@ -109,28 +86,62 @@ def pulse_to_duty(pulse_us):
     return (pulse_us * 65535) // SERVO_PERIOD_US
 
 
+def angle_to_pulse(angle_deg):
+    if angle_deg < 0:
+        angle_deg = 0
+    elif angle_deg > 180:
+        angle_deg = 180
+    return SERVO_MIN_US + int((angle_deg * (SERVO_MAX_US - SERVO_MIN_US)) / 180)
+
+
+def pulse_to_angle(pulse_us):
+    p = clamp_pulse(pulse_us)
+    return ((p - SERVO_MIN_US) * 180) / (SERVO_MAX_US - SERVO_MIN_US)
+
+
 # ---------------------------------------------------------------------------
-# Servo setup
+# Servo setup and live target tracking
 # ---------------------------------------------------------------------------
+servo_targets = [angle_to_pulse(SERVO_START_ANGLES[i]) for i in range(SERVO_COUNT)]
 SERVOS = []
-for gpio in SERVO_GPIOS:
+
+for i, gpio in enumerate(SERVO_GPIOS):
     pwm = PWM(Pin(gpio))
     pwm.freq(50)
-    pwm.duty_u16(pulse_to_duty(SERVO_START_US))
+    p = servo_targets[i]
+    pwm.duty_u16(pulse_to_duty(p))
     SERVOS.append(pwm)
+    offset = 4 + i * 2
+    targets_report[offset] = (p >> 8) & 0xFF
+    targets_report[offset + 1] = p & 0xFF
 
 
 def set_servo(servo_number, pulse_us):
     if not 0 <= servo_number < SERVO_COUNT:
         return False
-    SERVOS[servo_number].duty_u16(pulse_to_duty(clamp_pulse(pulse_us)))
+    clamped = clamp_pulse(pulse_us)
+    servo_targets[servo_number] = clamped
+    SERVOS[servo_number].duty_u16(pulse_to_duty(clamped))
+    offset = 4 + servo_number * 2
+    targets_report[offset] = (clamped >> 8) & 0xFF
+    targets_report[offset + 1] = clamped & 0xFF
     return True
 
 
 def set_all_servos(pulse_us):
-    duty = pulse_to_duty(clamp_pulse(pulse_us))
-    for pwm in SERVOS:
+    clamped = clamp_pulse(pulse_us)
+    duty = pulse_to_duty(clamped)
+    for i, pwm in enumerate(SERVOS):
+        servo_targets[i] = clamped
         pwm.duty_u16(duty)
+        offset = 4 + i * 2
+        targets_report[offset] = (clamped >> 8) & 0xFF
+        targets_report[offset + 1] = clamped & 0xFF
+
+
+def reset_to_starting_angles():
+    for i in range(SERVO_COUNT):
+        set_servo(i, angle_to_pulse(SERVO_START_ANGLES[i]))
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +154,6 @@ scan_adc = 0
 sample_sum = 0
 sample_count = 0
 next_adc_sample_at = 0
-ADC_SAMPLES = 4
-ADC_SAMPLE_GAP_US = 20
-MUX_SETTLE_US = 100  # 100 µs settle time for high-speed current telemetry
 
 
 def select_mux(mux_index):
@@ -202,75 +210,7 @@ def adc_scan_tick():
 start_scan()
 
 # ---------------------------------------------------------------------------
-# Debug instrumentation — no printing inside a live transaction, see notes
-# at the top of the file.
-# ---------------------------------------------------------------------------
-HEARTBEAT_MS = 2000
-
-import micropython
-
-micropython.alloc_emergency_exception_buf(100)
-gc.enable()  # Ensure MicroPython automatic GC is active
-
-stats_writes_ok = 0
-stats_writes_bad = 0
-stats_reads_ok = 0
-stats_overflow = 0
-stats_invalid_packet = 0
-stats_gc_collections = 0
-stats_gc_last_freed = 0
-stats_gc_worst_us = 0
-stats_i2c_exceptions = 0
-stats_adc_exceptions = 0
-
-loop_last_tick_us = ticks_us()
-loop_worst_gap_us = 0
-
-read_txn_start_us = 0
-read_txn_worst_us = 0
-
-last_heartbeat_ms = ticks_ms()
-
-
-def heartbeat():
-    global loop_worst_gap_us, read_txn_worst_us
-    free = gc.mem_free()
-    alloc = gc.mem_alloc()
-    print(
-        "[hb] free={} alloc={} | writes ok={} bad={} | reads ok={} | "
-        "overflow={} invalid={} | gc n={} last_freed={} worst_us={} | "
-        "loop worst_gap_us={} | read_txn worst_us={} | exc i2c={} adc={}".format(
-            free, alloc,
-            stats_writes_ok, stats_writes_bad,
-            stats_reads_ok,
-            stats_overflow, stats_invalid_packet,
-            stats_gc_collections, stats_gc_last_freed, stats_gc_worst_us,
-            loop_worst_gap_us,
-            read_txn_worst_us,
-            stats_i2c_exceptions, stats_adc_exceptions,
-        )
-    )
-    loop_worst_gap_us = 0
-    read_txn_worst_us = 0
-
-
-def safe_collect():
-    """Run GC at a point we know the bus is idle (right after a write
-    transaction finishes), and time how long it took."""
-    global stats_gc_collections, stats_gc_last_freed, stats_gc_worst_us
-    before = gc.mem_free()
-    t0 = ticks_us()
-    gc.collect()
-    dt = ticks_diff(ticks_us(), t0)
-    after = gc.mem_free()
-    stats_gc_collections += 1
-    stats_gc_last_freed = after - before
-    if dt > stats_gc_worst_us:
-        stats_gc_worst_us = dt
-
-
-# ---------------------------------------------------------------------------
-# Self-contained Zero-Allocation RP2040 I2C Slave Driver
+# Zero-Allocation RP2040 I2C Slave Driver
 # ---------------------------------------------------------------------------
 IO_BANK0_BASE = 0x40014000
 I2C0_BASE     = 0x40044000
@@ -434,7 +374,7 @@ slave = RP2040_Slave_Driver(
 )
 
 MAX_RX_LEN = 4
-rx_buffer = bytearray(MAX_RX_LEN)  # pre-allocated once, no per-txn alloc
+rx_buffer = bytearray(MAX_RX_LEN)
 rx_len = 0
 rx_overflow = False
 
@@ -451,53 +391,41 @@ def set_reply(data):
 
 
 def process_command(length):
-    global stats_writes_ok, stats_writes_bad, stats_invalid_packet
-
     if length == 0:
         return
 
     cmd = rx_buffer[0]
-    print("[cmd] rx_len={} cmd=0x{:02X}".format(length, cmd))
 
     if cmd == CMD_SET_SERVO and length >= 4:
         pulse_us = (rx_buffer[2] << 8) | rx_buffer[3]
         ok = set_servo(rx_buffer[1], pulse_us)
         set_reply(reply_ok if ok else reply_err)
-        if ok:
-            stats_writes_ok += 1
-        else:
-            stats_writes_bad += 1
 
     elif cmd == CMD_SET_ALL and length >= 3:
         set_all_servos((rx_buffer[1] << 8) | rx_buffer[2])
         set_reply(reply_ok)
-        stats_writes_ok += 1
 
     elif cmd == CMD_SAFE:
-        set_all_servos(SERVO_START_US)
+        reset_to_starting_angles()
         set_reply(reply_ok)
-        stats_writes_ok += 1
 
     elif cmd == CMD_READ_ADC_REPORT:
-        print("[cmd] staged ADC report (len={}) magic=0x{:02X}".format(len(adc_report), adc_report[0]))
         set_reply(adc_report)
+
+    elif cmd == CMD_READ_TARGET_REPORT:
+        set_reply(targets_report)
 
     else:
         set_reply(reply_err)
-        stats_invalid_packet += 1
 
 
 def i2c_tick():
     global rx_len, rx_overflow, reply_index
-    global stats_overflow, stats_reads_ok
-    global read_txn_start_us, read_txn_worst_us
 
     state = slave.handle_event()
 
     if state == STATE_START:
         reply_index = 0
-        if reply is adc_report:
-            read_txn_start_us = ticks_us()
 
     elif state == STATE_RECEIVE:
         while slave.Available():
@@ -517,86 +445,19 @@ def i2c_tick():
 
     elif state == STATE_FINISH:
         reply_index = 0
-        if reply is adc_report and read_txn_start_us:
-            dt = ticks_diff(ticks_us(), read_txn_start_us)
-            if dt > read_txn_worst_us:
-                read_txn_worst_us = dt
-            stats_reads_ok += 1
-            read_txn_start_us = 0
-
         if rx_len:
             if rx_overflow:
                 set_reply(reply_err)
-                stats_overflow += 1
             else:
                 process_command(rx_len)
             rx_len = 0
             rx_overflow = False
-            safe_collect()
 
 
-
-
-
-alloc_i2c_total = 0
-alloc_adc_total = 0
-alloc_other_total = 0
-
-
-def heartbeat():
-    global loop_worst_gap_us, read_txn_worst_us
-    global alloc_i2c_total, alloc_adc_total, alloc_other_total
-    free = gc.mem_free()
-    alloc = gc.mem_alloc()
-    print(
-        "[hb] free={} alloc={} | alloc_bytes: i2c={} adc={} other={} | writes ok={} | reads ok={} | gap_us={}".format(
-            free, alloc,
-            alloc_i2c_total, alloc_adc_total, alloc_other_total,
-            stats_writes_ok, stats_reads_ok,
-            loop_worst_gap_us,
-        )
-    )
-    alloc_i2c_total = 0
-    alloc_adc_total = 0
-    alloc_other_total = 0
-    loop_worst_gap_us = 0
-    read_txn_worst_us = 0
-
-
+print("RP2040 servo slave ready: I2C0 GP20/GP21, address 0x2A")
 try:
-    print("RP2040 servo slave ready (debug build): I2C0 GP20/GP21, address 0x2A")
-
     while True:
-        now = ticks_us()
-        gap = ticks_diff(now, loop_last_tick_us)
-        if gap > loop_worst_gap_us:
-            loop_worst_gap_us = gap
-        loop_last_tick_us = now
-
-        _a0 = gc.mem_alloc()
-        try:
-            i2c_tick()
-        except Exception as e:
-            stats_i2c_exceptions += 1
-            print("!! i2c_tick exception:")
-            sys.print_exception(e)
-        _a1 = gc.mem_alloc()
-        if _a1 > _a0:
-            alloc_i2c_total += (_a1 - _a0)
-
-        try:
-            adc_scan_tick()
-        except Exception as e:
-            stats_adc_exceptions += 1
-            print("!! adc_scan_tick exception:")
-            sys.print_exception(e)
-        _a2 = gc.mem_alloc()
-        if _a2 > _a1:
-            alloc_adc_total += (_a2 - _a1)
-
-        if ticks_diff(ticks_ms(), last_heartbeat_ms) >= HEARTBEAT_MS:
-            heartbeat()
-            last_heartbeat_ms = ticks_ms()
-
+        i2c_tick()
+        adc_scan_tick()
 except KeyboardInterrupt:
     print("RP2040 slave stopped.")

@@ -73,6 +73,34 @@ python3 rpi_master.py monitor --interval 0.5
 They are S1-S4, S6-S9, S11-S14, and S16-S19; the hardware mapping does not
 provide ADC current routes for S0, S5, S10, S15, S20, or S21.
 
+## Terminal User Interface (TUI)
+
+For fast, interactive terminal-based control over SSH or local terminal without GUI dependencies:
+
+```sh
+python3 servo_tui.py
+```
+
+* **Keyboard controls**:
+  * `↑` / `↓` (or `k` / `j`): Select servo (`S00` .. `S21`)
+  * `←` / `→` (or `h` / `l`): Adjust angle by $\pm 1^\circ$
+  * `[` / `]` (or `PgUp` / `PgDn`): Adjust angle by $\pm 10^\circ$
+  * `0` .. `9`: Instant preset angles ($0^\circ, 20^\circ, \dots, 180^\circ$)
+  * `a` / `A`: Set all servos to selected angle
+  * `s` / `S`: Safe position (return all servos to starting angles)
+  * `q` / `ESC`: Quit
+
+## Command-Line Usage
+
+```sh
+python3 rpi_master.py set 0 1500           # Set S0 to 1500 us
+python3 rpi_master.py set-angle 0 90       # Set S0 to 90 degrees
+python3 rpi_master.py all-angles 90        # Set all servos to 90 degrees
+python3 rpi_master.py targets              # Read active target angles of all 22 servos
+python3 rpi_master.py read                 # Read bus voltage, currents, and target angles
+python3 rpi_master.py monitor --interval 0.5
+```
+
 ## Desktop GUI
 
 The control panel needs a Raspberry Pi desktop session (local monitor, VNC, or
@@ -82,11 +110,6 @@ remote desktop), plus Tkinter:
 sudo apt install -y python3-tk
 python3 servo_gui.py
 ```
-
-The GUI provides individual sliders and numeric inputs for S0-S21, **Set all**,
-a 1000 µs safe-position button, live MCP3425 bus voltage, and the current ADC
-values for all 16 routed channels. Sliders send a command only when released;
-use **Set** after typing a value in a numeric field.
 
 ## Examples
 
@@ -101,7 +124,9 @@ for other software:
 
 | Command | Bytes written | Result |
 | --- | --- | --- |
-| Set one servo | `01 SS HH LL` | `SS` is S0-S21; `HH LL` is pulse width in us. |
+| Set one servo | `01 SS HH LL` | `SS` is S0-S21; `HH LL` is pulse width in us (1000-2000 us). |
 | Set all servos | `02 HH LL` | Sets every servo to 1000-2000 us. |
-| Safe position | `03` | Sets every servo to 1000 us. |
+| Safe position | `03` | Sets every servo to its configured starting angle. |
 | Read current ADCs | Write `10`, then read 36 bytes | `A5 01 sequence 10` followed by 16 big-endian raw ADC values. |
+| Read target angles | Write `11`, then read 48 bytes | `B5 01 16 00` followed by 22 big-endian uint16 target pulse us values. |
+
