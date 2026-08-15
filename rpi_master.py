@@ -84,15 +84,22 @@ def safe_position(bus):
     write(bus, RP2040_ADDRESS, (CMD_SAFE_POSITION,))
 
 
-def read_servo_adc(bus):
+def read_servo_adc(bus, retries=3):
     # The command is completed by a STOP; the next transaction reads its report.
-    write(bus, RP2040_ADDRESS, (CMD_READ_ADC_REPORT,))
-    report = read(bus, RP2040_ADDRESS, REPORT_SIZE)
-    if len(report) != REPORT_SIZE or report[0] != REPORT_MAGIC or report[1] != 1 or report[3] != 16:
-        raise RuntimeError("invalid RP2040 ADC report: " + report.hex(" "))
+    for attempt in range(retries):
+        try:
+            write(bus, RP2040_ADDRESS, (CMD_READ_ADC_REPORT,))
+            time.sleep(0.005)  # Allow RP2040 slave time to stage the reply into FIFO
+            report = read(bus, RP2040_ADDRESS, REPORT_SIZE)
+            if len(report) != REPORT_SIZE or report[0] != REPORT_MAGIC or report[1] != 1 or report[3] != 16:
+                raise RuntimeError("invalid RP2040 ADC report: " + report.hex(" "))
 
-    raw_values = tuple((report[offset] << 8) | report[offset + 1] for offset in range(4, REPORT_SIZE, 2))
-    return report[2], raw_values
+            raw_values = tuple((report[offset] << 8) | report[offset + 1] for offset in range(4, REPORT_SIZE, 2))
+            return report[2], raw_values
+        except (OSError, RuntimeError) as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.01)
 
 
 def current_from_raw(raw):
@@ -103,7 +110,9 @@ def current_from_raw(raw):
 def read_mcp3425_bus_voltage(bus):
     # Request a fresh one-shot 16-bit conversion then wait for RDY=0.
     write(bus, MCP3425_ADDRESS, (MCP3425_CONFIG_16BIT_ONE_SHOT,))
-    deadline = time.monotonic() + 0.20
+    deadline = time.monotonic() + 0.25
+    # 16-bit 15 SPS conversion takes ~67 ms; sleep before polling to reduce bus congestion
+    time.sleep(0.05)
     while True:
         response = read(bus, MCP3425_ADDRESS, 3)
         if len(response) != 3:

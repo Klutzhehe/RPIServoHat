@@ -30,7 +30,10 @@ absolute voltage limits as well.
 ## Install the RP2040 application
 
 First install the contents of the library's `upy/` directory on the RP2040 as
-you already did. Then replace the RP2040 root-level `main.py` with this
+you already did. The `RPI-RP2` drive shown while BOOTSEL is held is only for
+copying a MicroPython `.uf2` firmware file; Python files must be copied through
+Thonny's **MicroPython device** filesystem after normal boot. Then replace the
+RP2040 root-level `main.py` with this
 repository's [`rp2040/main.py`](rp2040/main.py). Do **not** remove the library
 files `rp2040_slave.py`, `RP2040_I2C_Registers.py`, or its `core/` directory:
 the application imports them.
@@ -69,6 +72,27 @@ python3 rpi_master.py monitor --interval 0.5
 `read` and `monitor` show MCP3425 bus voltage plus the 16 current-sense routes.
 They are S1-S4, S6-S9, S11-S14, and S16-S19; the hardware mapping does not
 provide ADC current routes for S0, S5, S10, S15, S20, or S21.
+
+## Desktop GUI
+
+The control panel needs a Raspberry Pi desktop session (local monitor, VNC, or
+remote desktop), plus Tkinter:
+
+```sh
+sudo apt install -y python3-tk
+python3 servo_gui.py
+```
+
+The GUI provides individual sliders and numeric inputs for S0-S21, **Set all**,
+a 1000 µs safe-position button, live MCP3425 bus voltage, and the current ADC
+values for all 16 routed channels. Sliders send a command only when released;
+use **Set** after typing a value in a numeric field.
+
+## Examples
+
+See [`examples/`](examples/README.md) for a telemetry display, an editable pose,
+and a conservative one-servo sweep. Always begin with one disconnected or
+unloaded servo and confirm its safe travel before using a wider range.
 
 ## I2C protocol
 

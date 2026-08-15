@@ -53,6 +53,14 @@ CMD_READ_ADC_REPORT = 0x10  # [0x10], then master reads 36 bytes
 REPORT_MAGIC = 0xA5
 REPORT_VERSION = 0x01
 REPORT_SIZE = 36             # magic, version, sequence, count, 16 x uint16
+I2C_TX_FIFO_BATCH = 16       # Fill up to the RP2040 hardware I2C FIFO capacity
+
+# Pre-allocated report buffer to avoid runtime GC allocations
+adc_report = bytearray(REPORT_SIZE)
+adc_report[0] = REPORT_MAGIC
+adc_report[1] = REPORT_VERSION
+adc_report[2] = 0
+adc_report[3] = 16
 
 
 def clamp_pulse(pulse_us):
@@ -134,7 +142,15 @@ def adc_scan_tick():
         return
 
     # Store ADC-major, MUX-minor: exactly the mapping used by the original code.
-    adc_raw[scan_adc * 4 + scan_mux] = sample_sum // ADC_SAMPLES
+    avg_sample = sample_sum // ADC_SAMPLES
+    idx = scan_adc * 4 + scan_mux
+    adc_raw[idx] = avg_sample
+
+    # Update pre-allocated report buffer in place (zero-allocation)
+    offset = 4 + (idx * 2)
+    adc_report[offset] = (avg_sample >> 8) & 0xFF
+    adc_report[offset + 1] = avg_sample & 0xFF
+
     sample_sum = 0
     sample_count = 0
     scan_adc += 1
@@ -147,6 +163,7 @@ def adc_scan_tick():
     if scan_mux == 4:
         scan_mux = 0
         adc_sequence = (adc_sequence + 1) & 0xFF
+        adc_report[2] = adc_sequence
     select_mux(scan_mux)
     next_adc_sample_at = ticks_add(ticks_us(), MUX_SETTLE_US)
 
@@ -166,43 +183,32 @@ slave = RP2040_Slave(
 
 rx_buffer = bytearray()
 rx_overflow = False
-reply = bytearray((0xEE,))  # 0xEE means invalid command.
+reply_ok = bytearray((0x00,))
+reply_err = bytearray((0xEE,))
+reply = reply_err
 reply_index = 0
 
 
 def set_reply(data):
     global reply, reply_index
-    reply = bytearray(data)
+    reply = data
     reply_index = 0
-
-
-def build_adc_report():
-    report = bytearray(REPORT_SIZE)
-    report[0] = REPORT_MAGIC
-    report[1] = REPORT_VERSION
-    report[2] = adc_sequence
-    report[3] = len(adc_raw)
-    for index, raw in enumerate(adc_raw):
-        offset = 4 + index * 2
-        report[offset] = raw >> 8
-        report[offset + 1] = raw & 0xFF
-    set_reply(report)
 
 
 def process_command(packet):
     if len(packet) == 4 and packet[0] == CMD_SET_SERVO:
         pulse_us = (packet[2] << 8) | packet[3]
-        set_reply((0x00 if set_servo(packet[1], pulse_us) else 0xEE,))
+        set_reply(reply_ok if set_servo(packet[1], pulse_us) else reply_err)
     elif len(packet) == 3 and packet[0] == CMD_SET_ALL:
         set_all_servos((packet[1] << 8) | packet[2])
-        set_reply((0x00,))
+        set_reply(reply_ok)
     elif len(packet) == 1 and packet[0] == CMD_SAFE:
         set_all_servos(SERVO_START_US)
-        set_reply((0x00,))
+        set_reply(reply_ok)
     elif len(packet) == 1 and packet[0] == CMD_READ_ADC_REPORT:
-        build_adc_report()
+        set_reply(adc_report)
     else:
-        set_reply((0xEE,))
+        set_reply(reply_err)
 
 
 def i2c_tick():
@@ -221,22 +227,27 @@ def i2c_tick():
             else:
                 rx_overflow = True
     elif state == slave.I2CStateMachine.I2C_REQUEST:
-        if reply_index < len(reply):
-            slave.Slave_Write_Data(reply[reply_index])
-            reply_index += 1
-        else:
-            slave.Slave_Write_Data(0x00)
+        # Fill the hardware TX FIFO up to FIFO depth to prevent SCL clock-stretching timeouts
+        for _ in range(I2C_TX_FIFO_BATCH):
+            if reply_index < len(reply):
+                slave.Slave_Write_Data(reply[reply_index])
+                reply_index += 1
+            else:
+                slave.Slave_Write_Data(0x00)
     elif state == slave.I2CStateMachine.I2C_FINISH:
         if rx_buffer:
             if rx_overflow:
-                set_reply((0xEE,))
+                set_reply(reply_err)
             else:
                 process_command(rx_buffer)
         rx_buffer = bytearray()
         rx_overflow = False
 
 
-print("RP2040 servo slave ready: I2C0 GP20/GP21, address 0x2A")
-while True:
-    i2c_tick()
-    adc_scan_tick()
+try:
+    print("RP2040 servo slave ready: I2C0 GP20/GP21, address 0x2A")
+    while True:
+        i2c_tick()
+        adc_scan_tick()
+except KeyboardInterrupt:
+    print("RP2040 slave stopped.")
