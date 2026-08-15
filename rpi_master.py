@@ -263,11 +263,12 @@ def main():
 
     with SMBus(I2C_BUS) as bus:
         if args.command == "set":
-            set_servo(bus, args.servo, args.angle)
-            print(f"Set S{args.servo:02d} to {clamp_angle(args.angle):.1f}° ({angle_to_pulse(args.angle)} µs)")
+            angle, pulse = set_servo(bus, args.servo, args.angle)
+            print(f"Set S{args.servo:02d} to {angle:.1f}° ({pulse} µs)")
         elif args.command == "all":
-            set_all_servos(bus, args.angle)
-            print(f"Set all servos to {clamp_angle(args.angle):.1f}° ({angle_to_pulse(args.angle)} µs)")
+            angle, pulse = set_all_servos(bus, args.angle)
+            print(f"Set all servos to {angle:.1f}° ({pulse} µs)")
+
         elif args.command == "set-pulse":
             set_servo_pulse(bus, args.servo, args.pulse_us)
             print(f"Set S{args.servo:02d} to {clamp_pulse(args.pulse_us)} µs ({pulse_to_angle(args.pulse_us):.1f}°)")

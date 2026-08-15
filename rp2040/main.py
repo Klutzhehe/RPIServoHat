@@ -322,34 +322,34 @@ class RP2040_Slave_Driver:
         intr = mem32[base | IC_RAW_INTR_STAT]
         status = mem32[base | IC_STATUS]
 
-        # 1. Start / Restart condition detected
-        if intr & (INTR_START_DET | INTR_RESTART_DET):
-            _ = mem32[base | IC_CLR_START_DET]
-            _ = mem32[base | IC_CLR_RESTART_DET]
-            return STATE_START
+        # 1. High priority: Drain RX FIFO if data is waiting
+        if status & STATUS_RFNE:
+            return STATE_RECEIVE
 
         # 2. Master is requesting data (Read Request)
         if intr & INTR_RD_REQ:
             return STATE_REQUEST
 
-        # 3. If RX FIFO has data, service it
-        if status & STATUS_RFNE:
-            return STATE_RECEIVE
-
-        # 4. Master aborted transaction
+        # 3. Master aborted transaction
         if intr & INTR_TX_ABRT:
             _ = mem32[base | IC_CLR_TX_ABRT]
             return STATE_FINISH
 
-        # 5. Master finished reading
+        # 4. Master finished reading
         if intr & INTR_RX_DONE:
             _ = mem32[base | IC_CLR_RX_DONE]
             return STATE_FINISH
 
-        # 6. Stop condition detected
+        # 5. Stop condition detected
         if intr & INTR_STOP_DET:
             _ = mem32[base | IC_CLR_STOP_DET]
             return STATE_FINISH
+
+        # 6. Start / Restart condition detected
+        if intr & (INTR_START_DET | INTR_RESTART_DET):
+            _ = mem32[base | IC_CLR_START_DET]
+            _ = mem32[base | IC_CLR_RESTART_DET]
+            return STATE_START
 
         # 7. Clear overflow errors
         if intr & (INTR_RX_OVER | INTR_TX_OVER | INTR_RX_UNDER):
@@ -454,8 +454,6 @@ def i2c_tick():
         return False
 
     if state == STATE_START:
-        rx_len = 0
-        rx_overflow = False
         reply_index = 0
 
     elif state == STATE_RECEIVE:
