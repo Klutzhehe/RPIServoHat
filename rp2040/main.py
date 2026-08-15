@@ -1,14 +1,14 @@
-"""22-servo RP2040 MicroPython I2C slave application — DEBUG BUILD.
+"""22-servo RP2040 MicroPython I2C slave application.
 
-High-performance, instrumented implementation for Raspberry Pi master communication:
+High-performance, zero-allocation implementation for Raspberry Pi master communication:
   - 22 PWM servo outputs: S0..S19=GP0..GP19, S20=GP22, S21=GP23
   - Configurable startup angle table for all 22 servos (default 90 deg / 1500 us)
   - Live target pulse/angle tracking
-  - High-speed I2C slave driver embedded with zero runtime GC allocation
-  - Fast ADC current multiplexer scan loop (100 us settle)
+  - Priority I2C loop: tight FIFO service loop takes precedence over ADC scanning
+  - Framing safety: START_DET resets rx_buffer state immediately
+  - Zero runtime GC allocation inside i2c_tick and adc_scan_tick
   - Command 0x10: 36-byte current-sense ADC report (Magic 0xA5)
   - Command 0x11: 48-byte servo target pulse/angle report (Magic 0xB5)
-  - Diagnostic heartbeat and exception guards to isolate runtime crashes
 """
 
 from machine import ADC, PWM, Pin, mem32
@@ -320,40 +320,36 @@ class RP2040_Slave_Driver:
         intr = mem32[base | IC_RAW_INTR_STAT]
         status = mem32[base | IC_STATUS]
 
-        # 1. PRIORITY: If RX FIFO has data, service it FIRST before STOP
-        if status & STATUS_RFNE:
-            return STATE_RECEIVE
+        # 1. Start / Restart condition detected - service FIRST to frame transaction
+        if intr & (INTR_START_DET | INTR_RESTART_DET):
+            _ = mem32[base | IC_CLR_START_DET]
+            _ = mem32[base | IC_CLR_RESTART_DET]
+            return STATE_START
 
         # 2. Master is requesting data (Read Request)
         if intr & INTR_RD_REQ:
             return STATE_REQUEST
 
-        # 3. Master aborted transaction
+        # 3. If RX FIFO has data, service it
+        if status & STATUS_RFNE:
+            return STATE_RECEIVE
+
+        # 4. Master aborted transaction
         if intr & INTR_TX_ABRT:
             _ = mem32[base | IC_CLR_TX_ABRT]
             return STATE_FINISH
 
-        # 4. Master finished reading
+        # 5. Master finished reading
         if intr & INTR_RX_DONE:
             _ = mem32[base | IC_CLR_RX_DONE]
             return STATE_FINISH
 
-        # 5. Stop condition detected
+        # 6. Stop condition detected
         if intr & INTR_STOP_DET:
             _ = mem32[base | IC_CLR_STOP_DET]
             return STATE_FINISH
 
-        # 6. Start condition detected
-        if intr & INTR_START_DET:
-            _ = mem32[base | IC_CLR_START_DET]
-            return STATE_START
-
-        # 7. Restart condition detected
-        if intr & INTR_RESTART_DET:
-            _ = mem32[base | IC_CLR_RESTART_DET]
-            return STATE_START
-
-        # 8. Clear overflow errors
+        # 7. Clear overflow errors
         if intr & (INTR_RX_OVER | INTR_TX_OVER | INTR_RX_UNDER):
             _ = mem32[base | IC_CLR_INTR]
 
@@ -448,11 +444,16 @@ def process_command(length):
 
 
 def i2c_tick():
+    """Service pending I2C hardware events. Returns True if an event was handled."""
     global rx_len, rx_overflow, reply_index, stats_overflow, stats_reads_ok
 
     state = slave.handle_event()
+    if state is None:
+        return False
 
     if state == STATE_START:
+        rx_len = 0
+        rx_overflow = False
         reply_index = 0
 
     elif state == STATE_RECEIVE:
@@ -482,6 +483,8 @@ def i2c_tick():
             rx_len = 0
             rx_overflow = False
             safe_collect()
+
+    return True
 
 
 HEARTBEAT_MS = 2000
@@ -522,13 +525,16 @@ while True:
     if gap > loop_worst_gap_us:
         loop_worst_gap_us = gap
 
+    # 1. PRIORITY: Drain and service all pending I2C hardware events in a tight loop
     try:
-        i2c_tick()
+        while i2c_tick():
+            pass
     except Exception as e:
         stats_exc_i2c += 1
         print("!! i2c_tick exception:", e)
         sys.print_exception(e)
 
+    # 2. Service one incremental ADC scan step only when I2C bus is quiet
     try:
         adc_scan_tick()
     except Exception as e:

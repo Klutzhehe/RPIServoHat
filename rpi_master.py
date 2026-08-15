@@ -64,14 +64,28 @@ DIVIDER_LOW_OHMS = 1000.0
 DIVIDER_RATIO = (DIVIDER_HIGH_OHMS + DIVIDER_LOW_OHMS) / DIVIDER_LOW_OHMS
 
 
-def write(bus, address, data):
-    bus.i2c_rdwr(i2c_msg.write(address, data))
+def write(bus, address, data, retries=3):
+    for attempt in range(retries):
+        try:
+            bus.i2c_rdwr(i2c_msg.write(address, data))
+            return
+        except (OSError, RuntimeError) as error:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.005)
 
 
-def read(bus, address, count):
-    message = i2c_msg.read(address, count)
-    bus.i2c_rdwr(message)
-    return bytes(message)
+def read(bus, address, count, retries=3):
+    for attempt in range(retries):
+        try:
+            message = i2c_msg.read(address, count)
+            bus.i2c_rdwr(message)
+            return bytes(message)
+        except (OSError, RuntimeError) as error:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.005)
+
 
 
 def clamp_angle(angle_deg):
