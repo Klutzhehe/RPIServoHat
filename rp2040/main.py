@@ -134,9 +134,7 @@ def set_all_servos(pulse_us):
 
 
 # ---------------------------------------------------------------------------
-# Incremental current-sense scan (unchanged — already non-blocking/allocation
-# free per call, so it wasn't the leading suspect, but it's left instrumented
-# via the exception guard in the main loop below just in case).
+# Incremental current-sense scan
 # ---------------------------------------------------------------------------
 adc_raw = [0] * 16
 adc_sequence = 0
@@ -145,6 +143,9 @@ scan_adc = 0
 sample_sum = 0
 sample_count = 0
 next_adc_sample_at = 0
+ADC_SAMPLES = 4
+ADC_SAMPLE_GAP_US = 20
+MUX_SETTLE_US = 100  # 100 µs settle time for high-speed current telemetry
 
 
 def select_mux(mux_index):
@@ -173,7 +174,6 @@ def adc_scan_tick():
     if sample_count < ADC_SAMPLES:
         return
 
-    # Store ADC-major, MUX-minor: exactly the mapping used by the original code.
     avg_sample = sample_sum // ADC_SAMPLES
     idx = scan_adc * 4 + scan_mux
     adc_raw[idx] = avg_sample
@@ -494,8 +494,6 @@ def i2c_tick():
     state = slave.handle_event()
 
     if state == STATE_START:
-        rx_len = 0
-        rx_overflow = False
         reply_index = 0
         if reply is adc_report:
             read_txn_start_us = ticks_us()
@@ -511,10 +509,7 @@ def i2c_tick():
 
     elif state == STATE_REQUEST:
         if reply_index < len(reply):
-            b = reply[reply_index]
-            slave.Slave_Write_Data(b)
-            if reply_index < 4:
-                print("[tx] byte {} = 0x{:02X}".format(reply_index, b))
+            slave.Slave_Write_Data(reply[reply_index])
             reply_index += 1
         else:
             slave.Slave_Write_Data(0x00)
@@ -537,6 +532,7 @@ def i2c_tick():
             rx_len = 0
             rx_overflow = False
             safe_collect()
+
 
 
 
