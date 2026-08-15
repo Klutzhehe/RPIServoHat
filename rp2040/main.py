@@ -452,10 +452,13 @@ def set_reply(data):
 def process_command(length):
     global stats_writes_ok, stats_writes_bad, stats_invalid_packet
 
+    if length == 0:
+        return
+
     cmd = rx_buffer[0]
     print("[cmd] rx_len={} cmd=0x{:02X}".format(length, cmd))
 
-    if length == 4 and cmd == CMD_SET_SERVO:
+    if cmd == CMD_SET_SERVO and length >= 4:
         pulse_us = (rx_buffer[2] << 8) | rx_buffer[3]
         ok = set_servo(rx_buffer[1], pulse_us)
         set_reply(reply_ok if ok else reply_err)
@@ -464,17 +467,17 @@ def process_command(length):
         else:
             stats_writes_bad += 1
 
-    elif length == 3 and cmd == CMD_SET_ALL:
+    elif cmd == CMD_SET_ALL and length >= 3:
         set_all_servos((rx_buffer[1] << 8) | rx_buffer[2])
         set_reply(reply_ok)
         stats_writes_ok += 1
 
-    elif length == 1 and cmd == CMD_SAFE:
+    elif cmd == CMD_SAFE:
         set_all_servos(SERVO_START_US)
         set_reply(reply_ok)
         stats_writes_ok += 1
 
-    elif length == 1 and cmd == CMD_READ_ADC_REPORT:
+    elif cmd == CMD_READ_ADC_REPORT:
         print("[cmd] staged ADC report (len={}) magic=0x{:02X}".format(len(adc_report), adc_report[0]))
         set_reply(adc_report)
 
@@ -491,6 +494,8 @@ def i2c_tick():
     state = slave.handle_event()
 
     if state == STATE_START:
+        rx_len = 0
+        rx_overflow = False
         reply_index = 0
         if reply is adc_report:
             read_txn_start_us = ticks_us()
@@ -532,6 +537,7 @@ def i2c_tick():
             rx_len = 0
             rx_overflow = False
             safe_collect()
+
 
 
 

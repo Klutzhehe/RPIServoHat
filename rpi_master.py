@@ -89,7 +89,7 @@ def read_servo_adc(bus, retries=3):
     for attempt in range(retries):
         try:
             write(bus, RP2040_ADDRESS, (CMD_READ_ADC_REPORT,))
-            time.sleep(0.005)  # Allow RP2040 slave time to stage the reply into FIFO
+            time.sleep(0.010)  # Allow RP2040 slave time to stage the reply into FIFO
             report = read(bus, RP2040_ADDRESS, REPORT_SIZE)
             if len(report) != REPORT_SIZE or report[0] != REPORT_MAGIC or report[1] != 1 or report[3] != 16:
                 raise RuntimeError("invalid RP2040 ADC report: " + report.hex(" "))
