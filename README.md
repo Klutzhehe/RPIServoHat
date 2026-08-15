@@ -66,6 +66,23 @@ The HAT separates high-level control logic from deterministic hardware PWM gener
   <img src="docs/images/pcb_layout.png" alt="RP2040 22-Servo HAT PCB Layout" width="85%" />
 </p>
 
+### Hardware Schematics
+
+<details>
+<summary><b>Click to expand Hardware Schematics (Pages 1 & 2)</b></summary>
+
+#### Schematic Page 1: RP2040 MCU, Flash, USB Type-C & Headers
+<p align="center">
+  <img src="docs/images/schematic_p1.png" alt="RP2040 22-Servo HAT Schematic Page 1" width="100%" />
+</p>
+
+#### Schematic Page 2: Power Regulation, INA180 Current Sensing, Multiplexing & MCP3425 ADC
+<p align="center">
+  <img src="docs/images/schematic_p2.png" alt="RP2040 22-Servo HAT Schematic Page 2" width="100%" />
+</p>
+
+</details>
+
 ---
 
 ## Setup & Installation
