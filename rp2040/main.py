@@ -453,6 +453,7 @@ def process_command(length):
     global stats_writes_ok, stats_writes_bad, stats_invalid_packet
 
     cmd = rx_buffer[0]
+    print("[cmd] rx_len={} cmd=0x{:02X}".format(length, cmd))
 
     if length == 4 and cmd == CMD_SET_SERVO:
         pulse_us = (rx_buffer[2] << 8) | rx_buffer[3]
@@ -474,9 +475,8 @@ def process_command(length):
         stats_writes_ok += 1
 
     elif length == 1 and cmd == CMD_READ_ADC_REPORT:
+        print("[cmd] staged ADC report (len={}) magic=0x{:02X}".format(len(adc_report), adc_report[0]))
         set_reply(adc_report)
-        # stats_reads_ok is incremented when the matching read transaction
-        # actually reaches I2C_FINISH, not here — this only stages the reply.
 
     else:
         set_reply(reply_err)
@@ -493,7 +493,6 @@ def i2c_tick():
     if state == STATE_START:
         reply_index = 0
         if reply is adc_report:
-            # A read of the previously-staged ADC report is starting now.
             read_txn_start_us = ticks_us()
 
     elif state == STATE_RECEIVE:
@@ -506,9 +505,11 @@ def i2c_tick():
                 rx_overflow = True
 
     elif state == STATE_REQUEST:
-        # Write exactly one byte for this read request so no unread bytes get trapped in TX FIFO
         if reply_index < len(reply):
-            slave.Slave_Write_Data(reply[reply_index])
+            b = reply[reply_index]
+            slave.Slave_Write_Data(b)
+            if reply_index < 4:
+                print("[tx] byte {} = 0x{:02X}".format(reply_index, b))
             reply_index += 1
         else:
             slave.Slave_Write_Data(0x00)
@@ -530,7 +531,8 @@ def i2c_tick():
                 process_command(rx_len)
             rx_len = 0
             rx_overflow = False
-            safe_collect()  # bus is idle right here — our chosen GC point
+            safe_collect()
+
 
 
 alloc_i2c_total = 0
