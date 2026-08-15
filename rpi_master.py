@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Raspberry Pi I2C master for the RP2040 MicroPython servo board and MCP3425A0T.
 
-Both peripherals share the Raspberry Pi's I2C-1 bus:
-  Raspberry Pi SDA/SCL <-> RP2040 GP20/GP21 <-> MCP3425 SDA/SCL
+Servos are controlled by angle (0° to 180°), matching Arduino's Servo.write(angle) API.
+  Angle 0°   -> 1000 µs
+  Angle 90°  -> 1500 µs (Neutral)
+  Angle 180° -> 2000 µs
 
 Examples:
-  python3 rpi_master.py set 0 1500
-  python3 rpi_master.py set-angle 0 90
-  python3 rpi_master.py all-angles 90
-  python3 rpi_master.py targets
-  python3 rpi_master.py read
-  python3 rpi_master.py monitor --interval 0.2
+  python3 rpi_master.py set 0 90          # Set S0 to 90 degrees
+  python3 rpi_master.py all 90            # Set all servos to 90 degrees
+  python3 rpi_master.py targets           # Read active target angles of all 22 servos
+  python3 rpi_master.py read              # Read bus voltage, currents, and target angles
+  python3 rpi_master.py monitor --interval 0.5
 """
 
 import argparse
@@ -27,10 +28,11 @@ RP2040_ADDRESS = 0x2A
 MCP3425_ADDRESS = 0x68  # MCP3425A0T; A1/A2/A3 parts use 0x69/0x6A/0x6B.
 
 SERVO_COUNT = 22
-SERVO_MIN_US = 1000
-SERVO_MAX_US = 2000
 SERVO_MIN_ANGLE = 0.0
 SERVO_MAX_ANGLE = 180.0
+SERVO_MIN_US = 1000
+SERVO_MAX_US = 2000
+SERVO_START_ANGLE = 90.0
 
 # Physical GP pin controlled by each S number.
 SERVO_GPIO = tuple(range(20)) + (22, 23)
@@ -72,12 +74,12 @@ def read(bus, address, count):
     return bytes(message)
 
 
-def clamp_pulse(pulse_us):
-    return max(SERVO_MIN_US, min(SERVO_MAX_US, int(pulse_us)))
-
-
 def clamp_angle(angle_deg):
     return max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, float(angle_deg)))
+
+
+def clamp_pulse(pulse_us):
+    return max(SERVO_MIN_US, min(SERVO_MAX_US, int(pulse_us)))
 
 
 def angle_to_pulse(angle_deg):
@@ -90,27 +92,36 @@ def pulse_to_angle(pulse_us):
     return (p - SERVO_MIN_US) * 180.0 / (SERVO_MAX_US - SERVO_MIN_US)
 
 
-def set_servo(bus, servo, pulse_us):
+def set_servo(bus, servo, angle_deg):
+    """Set servo position by angle (0 to 180 degrees)."""
+    if not 0 <= servo < SERVO_COUNT:
+        raise ValueError("servo must be 0 through 21")
+    pulse_us = angle_to_pulse(angle_deg)
+    write(bus, RP2040_ADDRESS, (CMD_SET_SERVO, servo, pulse_us >> 8, pulse_us & 0xFF))
+
+
+def set_servo_pulse(bus, servo, pulse_us):
+    """Set servo position directly by pulse width in microseconds (1000 - 2000 us)."""
     if not 0 <= servo < SERVO_COUNT:
         raise ValueError("servo must be 0 through 21")
     pulse_us = clamp_pulse(pulse_us)
     write(bus, RP2040_ADDRESS, (CMD_SET_SERVO, servo, pulse_us >> 8, pulse_us & 0xFF))
 
 
-def set_servo_angle(bus, servo, angle_deg):
-    set_servo(bus, servo, angle_to_pulse(angle_deg))
+def set_all_servos(bus, angle_deg):
+    """Set all servos to the given angle (0 to 180 degrees)."""
+    pulse_us = angle_to_pulse(angle_deg)
+    write(bus, RP2040_ADDRESS, (CMD_SET_ALL, pulse_us >> 8, pulse_us & 0xFF))
 
 
-def set_all_servos(bus, pulse_us):
+def set_all_servos_pulse(bus, pulse_us):
+    """Set all servos directly by pulse width in microseconds (1000 - 2000 us)."""
     pulse_us = clamp_pulse(pulse_us)
     write(bus, RP2040_ADDRESS, (CMD_SET_ALL, pulse_us >> 8, pulse_us & 0xFF))
 
 
-def set_all_servo_angles(bus, angle_deg):
-    set_all_servos(bus, angle_to_pulse(angle_deg))
-
-
 def safe_position(bus):
+    """Reset all servos to their configured starting angle."""
     write(bus, RP2040_ADDRESS, (CMD_SAFE_POSITION,))
 
 
@@ -202,22 +213,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    set_parser = subparsers.add_parser("set", help="Set servo pulse width in us (1000-2000)")
+    set_parser = subparsers.add_parser("set", help="Set servo angle in degrees (0-180)")
     set_parser.add_argument("servo", type=int, help="Servo index 0-21")
-    set_parser.add_argument("pulse_us", type=int, help="Pulse width in us")
+    set_parser.add_argument("angle", type=float, help="Angle in degrees (0-180)")
 
-    set_angle_parser = subparsers.add_parser("set-angle", help="Set servo angle in degrees (0-180)")
-    set_angle_parser.add_argument("servo", type=int, help="Servo index 0-21")
-    set_angle_parser.add_argument("angle", type=float, help="Angle in degrees (0-180)")
+    all_parser = subparsers.add_parser("all", help="Set all servos to an angle in degrees (0-180)")
+    all_parser.add_argument("angle", type=float, help="Angle in degrees (0-180)")
 
-    all_parser = subparsers.add_parser("all", help="Set all servos pulse width in us")
-    all_parser.add_argument("pulse_us", type=int, help="Pulse width in us")
+    set_pulse_parser = subparsers.add_parser("set-pulse", help="Set servo pulse width in us (1000-2000)")
+    set_pulse_parser.add_argument("servo", type=int, help="Servo index 0-21")
+    set_pulse_parser.add_argument("pulse_us", type=int, help="Pulse width in us")
 
-    all_angle_parser = subparsers.add_parser("all-angles", help="Set all servos angle in degrees")
-    all_angle_parser.add_argument("angle", type=float, help="Angle in degrees (0-180)")
+    all_pulse_parser = subparsers.add_parser("all-pulse", help="Set all servos pulse width in us (1000-2000)")
+    all_pulse_parser.add_argument("pulse_us", type=int, help="Pulse width in us")
 
-    subparsers.add_parser("targets", help="Read target angles of all 22 servos")
-    subparsers.add_parser("safe", help="Return all servos to startup safe position")
+    subparsers.add_parser("targets", help="Read active target angles of all 22 servos")
+    subparsers.add_parser("safe", help="Return all servos to safe starting position")
     subparsers.add_parser("read", help="Read bus voltage, currents, and target angles")
 
     monitor_parser = subparsers.add_parser("monitor", help="Continuously monitor telemetry")
@@ -227,22 +238,22 @@ def main():
 
     with SMBus(I2C_BUS) as bus:
         if args.command == "set":
-            set_servo(bus, args.servo, args.pulse_us)
-            print(f"Set S{args.servo:02d} to {clamp_pulse(args.pulse_us)} µs")
-        elif args.command == "set-angle":
-            set_servo_angle(bus, args.servo, args.angle)
+            set_servo(bus, args.servo, args.angle)
             print(f"Set S{args.servo:02d} to {clamp_angle(args.angle):.1f}° ({angle_to_pulse(args.angle)} µs)")
         elif args.command == "all":
-            set_all_servos(bus, args.pulse_us)
-            print(f"Set all servos to {clamp_pulse(args.pulse_us)} µs")
-        elif args.command == "all-angles":
-            set_all_servo_angles(bus, args.angle)
+            set_all_servos(bus, args.angle)
             print(f"Set all servos to {clamp_angle(args.angle):.1f}° ({angle_to_pulse(args.angle)} µs)")
+        elif args.command == "set-pulse":
+            set_servo_pulse(bus, args.servo, args.pulse_us)
+            print(f"Set S{args.servo:02d} to {clamp_pulse(args.pulse_us)} µs ({pulse_to_angle(args.pulse_us):.1f}°)")
+        elif args.command == "all-pulse":
+            set_all_servos_pulse(bus, args.pulse_us)
+            print(f"Set all servos to {clamp_pulse(args.pulse_us)} µs ({pulse_to_angle(args.pulse_us):.1f}°)")
         elif args.command == "targets":
             print_targets(bus)
         elif args.command == "safe":
             safe_position(bus)
-            print("Safe position command sent.")
+            print("Safe position command sent (all servos set to starting angles).")
         elif args.command == "read":
             print_status(bus)
         elif args.command == "monitor":
