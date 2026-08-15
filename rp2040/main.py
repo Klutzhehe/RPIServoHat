@@ -103,37 +103,59 @@ def pulse_to_angle(pulse_us):
 
 
 # ---------------------------------------------------------------------------
-# Servo setup with direct hardware duty_ns
+# Servo setup with pre-initialized hardware PWM (50 Hz locked carrier)
 # ---------------------------------------------------------------------------
 servo_targets = [angle_to_pulse(SERVO_START_ANGLES[i]) for i in range(SERVO_COUNT)]
 SERVOS = [None] * SERVO_COUNT
 
 
-def apply_pwm(servo_number, pulse_us):
-    gpio = SERVO_GPIOS[servo_number]
-    try:
-        pwm = SERVOS[servo_number]
-        if pwm is None:
+def init_servos():
+    """Pre-initialize hardware PWM on all servo GPIOs at 50 Hz with starting angles."""
+    ok_count = 0
+    for i, gpio in enumerate(SERVO_GPIOS):
+        try:
             pwm = PWM(Pin(gpio))
             pwm.freq(50)
+            target_pulse = servo_targets[i]
+            pwm.duty_ns(int(target_pulse) * 1000)
+            SERVOS[i] = pwm
+            ok_count += 1
+        except Exception as e:
+            print(f"Warning: Failed to init PWM on S{i:02d} (GP{gpio}): {e}")
+
+    # Populate initial target telemetry report
+    for i in range(SERVO_COUNT):
+        p = servo_targets[i]
+        offset = 4 + i * 2
+        targets_report[offset] = (p >> 8) & 0xFF
+        targets_report[offset + 1] = p & 0xFF
+
+    print(f"Initialized {ok_count}/{SERVO_COUNT} servo PWM channels at 50 Hz (default starting angles)")
+
+
+def apply_pwm(servo_number, pulse_us):
+    """Zero-allocation direct duty_ns update without reconfiguring slices or allocating objects."""
+    pwm = SERVOS[servo_number]
+    if pwm is not None:
+        try:
+            pwm.duty_ns(int(pulse_us) * 1000)
+        except Exception as e:
+            # Fallback to duty_u16 if duty_ns is unavailable
+            duty = (int(pulse_us) * 65535) // SERVO_PERIOD_US
+            pwm.duty_u16(duty)
+    else:
+        gpio = SERVO_GPIOS[servo_number]
+        try:
+            pwm = PWM(Pin(gpio))
+            pwm.freq(50)
+            pwm.duty_ns(int(pulse_us) * 1000)
             SERVOS[servo_number] = pwm
-        pwm.duty_ns(pulse_us * 1000)
-    except Exception as e:
-        # Fallback to duty_u16 if duty_ns is unavailable
-        duty = (pulse_us * 65535) // SERVO_PERIOD_US
-        pwm = PWM(Pin(gpio))
-        pwm.freq(50)
-        pwm.duty_u16(duty)
-        SERVOS[servo_number] = pwm
+        except Exception as e:
+            print(f"!! PWM error on S{servo_number} (GP{gpio}): {e}")
 
 
-# Populate target report buffer without eagerly claiming colliding PWM slices at boot
-for i in range(SERVO_COUNT):
-    p = servo_targets[i]
-    offset = 4 + i * 2
-    targets_report[offset] = (p >> 8) & 0xFF
-    targets_report[offset + 1] = p & 0xFF
-
+# Run eager servo initialization at boot
+init_servos()
 
 
 def set_servo(servo_number, pulse_us):
