@@ -1,8 +1,8 @@
 # RP2040 22-Servo HAT + Raspberry Pi Master
 
-A high-performance hardware and software system for controlling up to 22 PWM servos with live 16-channel current sensing and bus voltage monitoring over an I2C bus.
+A high-performance servo control and telemetry system for robotics, pan-tilt mechanisms, and multi-axis actuators over an I2C bus.
 
-The system connects a **Raspberry Pi** (acting as the I2C Master) to an **RP2040 / Raspberry Pi Pico** (acting as an I2C Slave, 50 Hz PWM generator, and telemetry scanner) alongside an onboard **MCP3425A0T** 16-bit $\Delta\Sigma$ ADC.
+The system connects a **Raspberry Pi** (acting as the I2C Master) to an **RP2040 coprocessor** (acting as an I2C Slave, 50 Hz PWM generator, and analog telemetry scanner) alongside an onboard **MCP3425A0T** 16-bit $\Delta\Sigma$ ADC.
 
 Servos are commanded by **Angle ($0^\circ \dots 180^\circ$)**, matching the Arduino `Servo.write(angle)` API, or directly by **Pulse Width ($1000 \dots 2000\,\mu\text{s}$)**:
 * **$0^\circ \iff 1000\,\mu\text{s}$**
@@ -25,63 +25,37 @@ Servos are commanded by **Angle ($0^\circ \dots 180^\circ$)**, matching the Ardu
 
 ---
 
-## Hardware Architecture & Pinout
+## System Architecture
 
-### 1. I2C Bus Wiring
+The HAT separates high-level control logic from deterministic hardware PWM generation:
 
-Connect the Raspberry Pi, RP2040, and MCP3425 to the Raspberry Pi's **3.3 V I2C-1** bus:
+```
+┌────────────────────────────────────────────────────────┐
+│               Raspberry Pi (I2C Master)                │
+│    Python CLI (rpi_master) / TUI / GUI / User App      │
+└───────────────┬────────────────────────┬───────────────┘
+                │ I2C Bus 1              │ I2C Bus 1
+                │ (Address 0x2A)         │ (Address 0x68)
+                ▼                        ▼
+┌──────────────────────────────┐  ┌──────────────────────┐
+│       RP2040 Coprocessor     │  │     MCP3425A0T       │
+│  • MicroPython I2C Slave     │  │  16-bit Delta-Sigma  │
+│  • 22x 50 Hz PWM Drivers     │  │  Bus Voltage Sensor  │
+│  • 16-Ch Current ADC Scanner │  └──────────────────────┘
+└───────────────┬──────────────┘
+                │ Dual 74HC4052 MUX
+                ▼
+┌──────────────────────────────┐
+│  16x Shunt Current Sensors   │
+│  + 22x Servo PWM Connectors  │
+└──────────────────────────────┘
+```
 
-| Signal | Raspberry Pi Header | RP2040 Pin | MCP3425A0T Pin | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **SDA** | GPIO 2 (Pin 3) | GP20 (Pin 26) | SDA (Pin 3) | I2C Data Line (3.3 V Logic) |
-| **SCL** | GPIO 3 (Pin 5) | GP21 (Pin 27) | SCL (Pin 4) | I2C Clock Line (3.3 V Logic) |
-| **GND** | Any GND Pin (e.g. Pin 6) | GND (Pin 38/any) | VSS & VIN- | Common Ground Reference |
-| **3.3 V** | 3V3 Power (Pin 1) | 3V3 (Pin 36) | VDD (Pin 1) | Logic Power Supply |
-
-> [!IMPORTANT]
-> The RP2040 and Raspberry Pi logic lines operate at **3.3 V**. Use pull-up resistors to 3.3 V only. Never connect 5 V logic to RP2040 or Raspberry Pi I2C pins.
-> * **RP2040 I2C Slave Address**: `0x2A`
-> * **MCP3425 ADC Address**: `0x68`
-
----
-
-### 2. Servo Channel to RP2040 GPIO Mapping
-
-| Servo Header | RP2040 GPIO | PWM Slice & Channel | Current Sense Shunt |
-| :---: | :---: | :---: | :---: |
-| **S00** | **GP00** | Slice 0, Ch A | Unrouted |
-| **S01** | **GP01** | Slice 0, Ch B | **Channel 1** |
-| **S02** | **GP02** | Slice 1, Ch A | **Channel 3** |
-| **S03** | **GP03** | Slice 1, Ch B | **Channel 2** |
-| **S04** | **GP04** | Slice 2, Ch A | **Channel 0** |
-| **S05** | **GP05** | Slice 2, Ch B | Unrouted |
-| **S06** | **GP06** | Slice 3, Ch A | **Channel 5** |
-| **S07** | **GP07** | Slice 3, Ch B | **Channel 7** |
-| **S08** | **GP08** | Slice 4, Ch A | **Channel 6** |
-| **S09** | **GP09** | Slice 4, Ch B | **Channel 4** |
-| **S10** | **GP10** | Slice 5, Ch A | Unrouted |
-| **S11** | **GP11** | Slice 5, Ch B | **Channel 9** |
-| **S12** | **GP12** | Slice 6, Ch A | **Channel 11** |
-| **S13** | **GP13** | Slice 6, Ch B | **Channel 10** |
-| **S14** | **GP14** | Slice 7, Ch A | **Channel 8** |
-| **S15** | **GP15** | Slice 7, Ch B | Unrouted |
-| **S16** | **GP16** | Slice 0, Ch A *(Shared)* | **Channel 13** |
-| **S17** | **GP17** | Slice 0, Ch B *(Shared)* | **Channel 15** |
-| **S18** | **GP18** | Slice 1, Ch A *(Shared)* | **Channel 14** |
-| **S19** | **GP19** | Slice 1, Ch B *(Shared)* | **Channel 12** |
-| **S20** | **GP22** | Slice 3, Ch A *(Shared)* | Unrouted |
-| **S21** | **GP23** | Slice 3, Ch B *(Shared)* | Unrouted |
-
-> [!NOTE]
-> **RP2040 PWM Hardware Architecture**: The RP2040 contains 8 hardware PWM slices (Slice 0–7) with 2 channels each (A and B), yielding **16 independent hardware PWM outputs** (`GP00`..`GP15`). Channels beyond GP15 share PWM slices with GP00..GP07.
-
----
-
-### 3. Current-Sense Multiplexing & Pin Assignments
-
-* **Multiplexer Address Lines**: `MUX_A0 = GP24`, `MUX_A1 = GP25`
-* **ADC Inputs**: `ADC0 = GP26`, `ADC1 = GP27`, `ADC2 = GP28`, `ADC3 = GP29`
-* **Current Shunts**: $0.020\,\Omega$ with INA gain $\times 50$.
+* **Raspberry Pi (Master)**: Executes user application code, kinematic calculations, or UI scripts over Linux `/dev/i2c-1`.
+* **RP2040 Coprocessor (Slave `0x2A`)**: Manages the low-level real-time tasks:
+  * Generates stable $50\,\text{Hz}$ servo PWM pulse streams with microsecond/nanosecond resolution.
+  * Rapidly samples 16 current shunts through dual 74HC4052 analog multiplexers into pre-allocated binary telemetry buffers.
+* **MCP3425A0T (ADC `0x68`)**: Monolithically measures the external servo power supply rail (with an onboard precision resistor divider), providing live bus voltage to the Raspberry Pi.
 
 ---
 
@@ -92,8 +66,7 @@ Connect the Raspberry Pi, RP2040, and MCP3425 to the Raspberry Pi's **3.3 V I2C-
 1. Flash the latest **MicroPython** firmware (UF2) to your Raspberry Pi Pico / RP2040 board.
 2. Open Thonny or your preferred MicroPython IDE and connect to the Pico over USB.
 3. Upload [`rp2040/main.py`](rp2040/main.py) to the root directory of the Pico as **`main.py`**.
-4. *(Optional)* Upload [`rp2040/test_servo_sweep.py`](rp2040/test_servo_sweep.py) to test physical servo movement directly without the Raspberry Pi.
-5. Soft-reset (Ctrl+D) or power-cycle the Pico. The console will display:
+4. Soft-reset (Ctrl+D) or power-cycle the Pico. The console will display:
    ```text
    Initialized 22/22 servo PWM channels at 50 Hz (default starting angles)
    RP2040 servo slave ready: I2C0 GP20/GP21, address 0x2A
@@ -108,21 +81,36 @@ Connect the Raspberry Pi, RP2040, and MCP3425 to the Raspberry Pi's **3.3 V I2C-
    sudo raspi-config
    # Navigate to: Interfacing Options -> I2C -> Enable -> Yes -> Finish
    ```
-2. Clone the repository and install the dependencies:
+
+2. Clone the repository:
    ```bash
    git clone https://github.com/Klutzhehe/RPIServoHat.git
    cd RPIServoHat
+   ```
+
+3. Create and activate a Python virtual environment:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+4. Install required dependencies:
+   ```bash
    pip install -r requirements.txt
    ```
-3. Test that both I2C devices are detected on bus 1:
+
+5. Verify that both I2C devices are detected on bus 1:
    ```bash
    sudo i2cdetect -y 1
    ```
-   * Address **`0x2A`** (RP2040 Slave) and **`0x68`** (MCP3425 ADC) must appear in the output grid.
+   * Address **`0x2A`** (RP2040 Slave) and **`0x68`** (MCP3425 ADC) should appear in the grid.
 
 ---
 
 ## Master Interfaces & Usage
+
+> [!TIP]
+> Ensure your virtual environment is active (`source venv/bin/activate`) when running any of the master scripts.
 
 ### 1. Command-Line Interface (`rpi_master.py`)
 
@@ -268,20 +256,6 @@ The [`examples/`](examples/) directory includes ready-to-run automation scripts:
   * Byte 2: Servo Count (`0x16` / 22 servos)
   * Byte 3: Reserved (`0x00`)
   * Bytes 4–47: $22 \times \text{uint16}$ (big-endian target pulse widths in $\mu\text{s}$)
-
----
-
-## Troubleshooting
-
-1. **Servo does not move on command**:
-   * Verify that the servo is plugged into the correct channel (e.g. `S0` is `GP0`, `S1` is `GP1`).
-   * Verify that servo power (5V/6V supply) is connected and powered on with common ground to the RP2040 and Raspberry Pi.
-   * If testing $90^\circ$ (neutral), the servo is already at neutral on boot. Test with `python3 rpi_master.py set 0 0` or `180` to see movement.
-2. **`i2cdetect` does not show `0x2A`**:
-   * Check that `GP20` (SDA) and `GP21` (SCL) are wired to Raspberry Pi GPIO 2 and GPIO 3.
-   * Check that [`rp2040/main.py`](rp2040/main.py) is running on the Pico.
-3. **`smbus2.i2c_msg` permission errors**:
-   * Ensure your user is in the `i2c` group: `sudo usermod -a -G i2c $USER`, then log out and log back in.
 
 ---
 
