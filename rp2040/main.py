@@ -2,10 +2,10 @@
 
 High-performance, zero-allocation implementation for Raspberry Pi master communication:
   - 22 PWM servo outputs: S0..S19=GP0..GP19, S20=GP22, S21=GP23
+  - Direct hardware nanosecond PWM duty (duty_ns) for 100% accurate servo timing
   - Configurable startup angle table for all 22 servos (default 90 deg / 1500 us)
   - Live target pulse/angle tracking
   - Priority I2C loop: tight FIFO service loop takes precedence over ADC scanning
-  - Zero runtime GC allocation inside i2c_tick and adc_scan_tick
   - Command 0x01: Set servo pulse width [0x01, servo 0..21, hi, lo]
   - Command 0x02: Set all servos pulse width [0x02, hi, lo]
   - Command 0x03: Return all servos to safe starting position
@@ -89,10 +89,6 @@ def clamp_pulse(pulse_us):
     return int(pulse_us)
 
 
-def pulse_to_duty(pulse_us):
-    return (int(pulse_us) * 65535) // SERVO_PERIOD_US
-
-
 def angle_to_pulse(angle_deg):
     if angle_deg < 0:
         angle_deg = 0
@@ -107,17 +103,33 @@ def pulse_to_angle(pulse_us):
 
 
 # ---------------------------------------------------------------------------
-# Servo setup and live target tracking
+# Servo setup with direct hardware duty_ns
 # ---------------------------------------------------------------------------
 servo_targets = [angle_to_pulse(SERVO_START_ANGLES[i]) for i in range(SERVO_COUNT)]
-SERVOS = []
+SERVOS = [None] * SERVO_COUNT
 
-for i, gpio in enumerate(SERVO_GPIOS):
-    pwm = PWM(Pin(gpio))
-    pwm.freq(50)
+
+def apply_pwm(servo_number, pulse_us):
+    gpio = SERVO_GPIOS[servo_number]
+    try:
+        pwm = SERVOS[servo_number]
+        if pwm is None:
+            pwm = PWM(Pin(gpio))
+            pwm.freq(50)
+            SERVOS[servo_number] = pwm
+        pwm.duty_ns(pulse_us * 1000)
+    except Exception as e:
+        # Fallback to duty_u16 if duty_ns is unavailable
+        duty = (pulse_us * 65535) // SERVO_PERIOD_US
+        pwm = PWM(Pin(gpio))
+        pwm.freq(50)
+        pwm.duty_u16(duty)
+        SERVOS[servo_number] = pwm
+
+
+for i in range(SERVO_COUNT):
     p = servo_targets[i]
-    pwm.duty_u16(pulse_to_duty(p))
-    SERVOS.append(pwm)
+    apply_pwm(i, p)
     offset = 4 + i * 2
     targets_report[offset] = (p >> 8) & 0xFF
     targets_report[offset + 1] = p & 0xFF
@@ -128,7 +140,7 @@ def set_servo(servo_number, pulse_us):
         return False
     clamped = clamp_pulse(pulse_us)
     servo_targets[servo_number] = clamped
-    SERVOS[servo_number].duty_u16(pulse_to_duty(clamped))
+    apply_pwm(servo_number, clamped)
     offset = 4 + servo_number * 2
     targets_report[offset] = (clamped >> 8) & 0xFF
     targets_report[offset + 1] = clamped & 0xFF
@@ -137,10 +149,9 @@ def set_servo(servo_number, pulse_us):
 
 def set_all_servos(pulse_us):
     clamped = clamp_pulse(pulse_us)
-    duty = pulse_to_duty(clamped)
-    for i, pwm in enumerate(SERVOS):
+    for i in range(SERVO_COUNT):
         servo_targets[i] = clamped
-        pwm.duty_u16(duty)
+        apply_pwm(i, clamped)
         offset = 4 + i * 2
         targets_report[offset] = (clamped >> 8) & 0xFF
         targets_report[offset + 1] = clamped & 0xFF
@@ -340,7 +351,7 @@ class RP2040_Slave_Driver:
             _ = mem32[base | IC_CLR_RX_DONE]
             return STATE_FINISH
 
-        # 5. Stop condition detected
+        # 5. Stop condition detected (end of write or read)
         if intr & INTR_STOP_DET:
             _ = mem32[base | IC_CLR_STOP_DET]
             return STATE_FINISH
@@ -418,7 +429,7 @@ def process_command(length):
         set_reply(reply_ok if ok else reply_err)
         if ok:
             stats_writes_ok += 1
-            print("[cmd] Set S{:02d} -> {} us ({:.1f} deg)".format(servo_id, pulse_us, pulse_to_angle(pulse_us)))
+            print("[cmd] Set S{:02d} (GP{:02d}) -> {} us ({:.1f} deg)".format(servo_id, SERVO_GPIOS[servo_id], pulse_us, pulse_to_angle(pulse_us)))
         else:
             stats_writes_bad += 1
 
