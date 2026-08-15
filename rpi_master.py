@@ -144,6 +144,11 @@ def set_all_servos_pulse(bus, pulse_us):
     return set_all_servos(bus, pulse_us)
 
 
+# Backward compatibility aliases
+set_servo_angle = set_servo
+set_all_servo_angles = set_all_servos
+
+
 
 def safe_position(bus):
     """Reset all servos to their configured starting angle."""
