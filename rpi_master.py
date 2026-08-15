@@ -106,32 +106,43 @@ def pulse_to_angle(pulse_us):
     return (p - SERVO_MIN_US) * 180.0 / (SERVO_MAX_US - SERVO_MIN_US)
 
 
-def set_servo(bus, servo, angle_deg):
-    """Set servo position by angle (0 to 180 degrees)."""
+def parse_pos(val):
+    """Automatically parse either angle (0-180 deg) or pulse width (1000-2000 us)."""
+    val = float(val)
+    if val <= 180.0:
+        angle = clamp_angle(val)
+        pulse = angle_to_pulse(angle)
+    else:
+        pulse = clamp_pulse(val)
+        angle = pulse_to_angle(pulse)
+    return angle, pulse
+
+
+def set_servo(bus, servo, pos):
+    """Set servo position by angle (0-180 deg) or pulse width (1000-2000 us)."""
     if not 0 <= servo < SERVO_COUNT:
         raise ValueError("servo must be 0 through 21")
-    pulse_us = angle_to_pulse(angle_deg)
-    write(bus, RP2040_ADDRESS, (CMD_SET_SERVO, servo, pulse_us >> 8, pulse_us & 0xFF))
+    angle, pulse = parse_pos(pos)
+    write(bus, RP2040_ADDRESS, (CMD_SET_SERVO, servo, pulse >> 8, pulse & 0xFF))
+    return angle, pulse
 
 
 def set_servo_pulse(bus, servo, pulse_us):
     """Set servo position directly by pulse width in microseconds (1000 - 2000 us)."""
-    if not 0 <= servo < SERVO_COUNT:
-        raise ValueError("servo must be 0 through 21")
-    pulse_us = clamp_pulse(pulse_us)
-    write(bus, RP2040_ADDRESS, (CMD_SET_SERVO, servo, pulse_us >> 8, pulse_us & 0xFF))
+    return set_servo(bus, servo, pulse_us)
 
 
-def set_all_servos(bus, angle_deg):
-    """Set all servos to the given angle (0 to 180 degrees)."""
-    pulse_us = angle_to_pulse(angle_deg)
-    write(bus, RP2040_ADDRESS, (CMD_SET_ALL, pulse_us >> 8, pulse_us & 0xFF))
+def set_all_servos(bus, pos):
+    """Set all servos to the given angle (0-180 deg) or pulse width (1000-2000 us)."""
+    angle, pulse = parse_pos(pos)
+    write(bus, RP2040_ADDRESS, (CMD_SET_ALL, pulse >> 8, pulse & 0xFF))
+    return angle, pulse
 
 
 def set_all_servos_pulse(bus, pulse_us):
     """Set all servos directly by pulse width in microseconds (1000 - 2000 us)."""
-    pulse_us = clamp_pulse(pulse_us)
-    write(bus, RP2040_ADDRESS, (CMD_SET_ALL, pulse_us >> 8, pulse_us & 0xFF))
+    return set_all_servos(bus, pulse_us)
+
 
 
 def safe_position(bus):

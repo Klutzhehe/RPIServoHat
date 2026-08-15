@@ -5,8 +5,10 @@ High-performance, zero-allocation implementation for Raspberry Pi master communi
   - Configurable startup angle table for all 22 servos (default 90 deg / 1500 us)
   - Live target pulse/angle tracking
   - Priority I2C loop: tight FIFO service loop takes precedence over ADC scanning
-  - Framing safety: START_DET resets rx_buffer state immediately
   - Zero runtime GC allocation inside i2c_tick and adc_scan_tick
+  - Command 0x01: Set servo pulse width [0x01, servo 0..21, hi, lo]
+  - Command 0x02: Set all servos pulse width [0x02, hi, lo]
+  - Command 0x03: Return all servos to safe starting position
   - Command 0x10: 36-byte current-sense ADC report (Magic 0xA5)
   - Command 0x11: 48-byte servo target pulse/angle report (Magic 0xB5)
 """
@@ -84,11 +86,11 @@ def clamp_pulse(pulse_us):
         return SERVO_MIN_US
     if pulse_us > SERVO_MAX_US:
         return SERVO_MAX_US
-    return pulse_us
+    return int(pulse_us)
 
 
 def pulse_to_duty(pulse_us):
-    return (pulse_us * 65535) // SERVO_PERIOD_US
+    return (int(pulse_us) * 65535) // SERVO_PERIOD_US
 
 
 def angle_to_pulse(angle_deg):
@@ -101,7 +103,7 @@ def angle_to_pulse(angle_deg):
 
 def pulse_to_angle(pulse_us):
     p = clamp_pulse(pulse_us)
-    return ((p - SERVO_MIN_US) * 180) / (SERVO_MAX_US - SERVO_MIN_US)
+    return ((p - SERVO_MIN_US) * 180.0) / (SERVO_MAX_US - SERVO_MIN_US)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +322,7 @@ class RP2040_Slave_Driver:
         intr = mem32[base | IC_RAW_INTR_STAT]
         status = mem32[base | IC_STATUS]
 
-        # 1. Start / Restart condition detected - service FIRST to frame transaction
+        # 1. Start / Restart condition detected
         if intr & (INTR_START_DET | INTR_RESTART_DET):
             _ = mem32[base | IC_CLR_START_DET]
             _ = mem32[base | IC_CLR_RESTART_DET]
@@ -401,11 +403,6 @@ def set_reply(data):
     reply_index = 0
 
 
-def safe_collect():
-    """Run GC only at chosen idle moments outside active transactions."""
-    gc.collect()
-
-
 def process_command(length):
     global stats_writes_ok, stats_writes_bad
 
@@ -415,23 +412,28 @@ def process_command(length):
     cmd = rx_buffer[0]
 
     if cmd == CMD_SET_SERVO and length >= 4:
+        servo_id = rx_buffer[1]
         pulse_us = (rx_buffer[2] << 8) | rx_buffer[3]
-        ok = set_servo(rx_buffer[1], pulse_us)
+        ok = set_servo(servo_id, pulse_us)
         set_reply(reply_ok if ok else reply_err)
         if ok:
             stats_writes_ok += 1
+            print("[cmd] Set S{:02d} -> {} us ({:.1f} deg)".format(servo_id, pulse_us, pulse_to_angle(pulse_us)))
         else:
             stats_writes_bad += 1
 
     elif cmd == CMD_SET_ALL and length >= 3:
-        set_all_servos((rx_buffer[1] << 8) | rx_buffer[2])
+        pulse_us = (rx_buffer[1] << 8) | rx_buffer[2]
+        set_all_servos(pulse_us)
         set_reply(reply_ok)
         stats_writes_ok += 1
+        print("[cmd] Set ALL -> {} us ({:.1f} deg)".format(pulse_us, pulse_to_angle(pulse_us)))
 
     elif cmd == CMD_SAFE:
         reset_to_starting_angles()
         set_reply(reply_ok)
         stats_writes_ok += 1
+        print("[cmd] Safe position (all servos to starting angles)")
 
     elif cmd == CMD_READ_ADC_REPORT:
         set_reply(adc_report)
@@ -482,7 +484,6 @@ def i2c_tick():
                 process_command(rx_len)
             rx_len = 0
             rx_overflow = False
-            safe_collect()
 
     return True
 
@@ -525,7 +526,6 @@ while True:
     if gap > loop_worst_gap_us:
         loop_worst_gap_us = gap
 
-    # 1. PRIORITY: Drain and service all pending I2C hardware events in a tight loop
     try:
         while i2c_tick():
             pass
@@ -534,7 +534,6 @@ while True:
         print("!! i2c_tick exception:", e)
         sys.print_exception(e)
 
-    # 2. Service one incremental ADC scan step only when I2C bus is quiet
     try:
         adc_scan_tick()
     except Exception as e:
