@@ -2,6 +2,11 @@
 
 A high-performance servo control and telemetry system for robotics, pan-tilt mechanisms, and multi-axis actuators over an I2C bus.
 
+<p align="center">
+  <img src="docs/images/pcb_3d_render.png" alt="RP2040 22-Servo HAT 3D Render" width="48%" />
+  <img src="docs/images/hardware_assembled.jpg" alt="RP2040 22-Servo HAT Hardware Setup" width="48%" />
+</p>
+
 The system connects a **Raspberry Pi** (acting as the I2C Master) to an **RP2040 coprocessor** (acting as an I2C Slave, 50 Hz PWM generator, and analog telemetry scanner) alongside an onboard **MCP3425A0T** 16-bit $\Delta\Sigma$ ADC.
 
 Servos are commanded by **Angle ($0^\circ \dots 180^\circ$)**, matching the Arduino `Servo.write(angle)` API, or directly by **Pulse Width ($1000 \dots 2000\,\mu\text{s}$)**:
@@ -56,6 +61,10 @@ The HAT separates high-level control logic from deterministic hardware PWM gener
   * Generates stable $50\,\text{Hz}$ servo PWM pulse streams with microsecond/nanosecond resolution.
   * Rapidly samples 16 current shunts through dual 74HC4052 analog multiplexers into pre-allocated binary telemetry buffers.
 * **MCP3425A0T (ADC `0x68`)**: Monolithically measures the external servo power supply rail (with an onboard precision resistor divider), providing live bus voltage to the Raspberry Pi.
+
+<p align="center">
+  <img src="docs/images/pcb_layout.png" alt="RP2040 22-Servo HAT PCB Layout" width="85%" />
+</p>
 
 ---
 
@@ -176,6 +185,10 @@ sudo apt install -y python3-tk
 # Launch the GUI:
 python3 servo_gui.py
 ```
+
+<p align="center">
+  <img src="docs/images/gui_screenshot.jpg" alt="RP2040 Servo HAT Desktop GUI" width="95%" />
+</p>
 
 Features interactive angle sliders, spinbox numeric inputs, global **Set All** / **Safe** buttons, and a live current telemetry table.
 
