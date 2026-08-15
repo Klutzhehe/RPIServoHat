@@ -351,9 +351,10 @@ class RP2040_Slave_Driver:
         mem32[self._i2c_base | MEM_CLR | IC_SAR] = 0x03FF
         mem32[self._i2c_base | MEM_SET | IC_SAR] = self._i2c_address & 0x03FF
 
-        # 3. Configure IC_CON: 7-bit slave mode, slave enabled, master disabled, clock stretching enabled
+        # 3. Configure IC_CON: 7-bit slave mode, slave enabled, master disabled,
+        # bit 7 (STOP_DET_IFADDRESSED) = 1, bit 9 (RX_FIFO_FULL_HLD_CTRL) = 1
         mem32[self._i2c_base | MEM_CLR | IC_CON] = 0x0041
-        mem32[self._i2c_base | MEM_SET | IC_CON] = 0x0200
+        mem32[self._i2c_base | MEM_SET | IC_CON] = 0x0280
 
         # 4. Enable I2C controller
         mem32[self._i2c_base | MEM_SET | IC_ENABLE] = 0x01
@@ -371,7 +372,7 @@ class RP2040_Slave_Driver:
     def handle_event(self):
         """Poll and service hardware I2C events with 0 allocations."""
         base = self._i2c_base
-        intr = mem32[base | IC_INTR_STAT]
+        intr = mem32[base | IC_RAW_INTR_STAT]
         status = mem32[base | IC_STATUS]
 
         # 1. PRIORITY: If RX FIFO has data, service it FIRST before STOP
