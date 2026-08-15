@@ -1,6 +1,6 @@
-"""22-servo RP2040 MicroPython I2C slave application.
+"""22-servo RP2040 MicroPython I2C slave application — DEBUG BUILD.
 
-High-performance, zero-allocation implementation for Raspberry Pi master communication:
+High-performance, instrumented implementation for Raspberry Pi master communication:
   - 22 PWM servo outputs: S0..S19=GP0..GP19, S20=GP22, S21=GP23
   - Configurable startup angle table for all 22 servos (default 90 deg / 1500 us)
   - Live target pulse/angle tracking
@@ -8,11 +8,16 @@ High-performance, zero-allocation implementation for Raspberry Pi master communi
   - Fast ADC current multiplexer scan loop (100 us settle)
   - Command 0x10: 36-byte current-sense ADC report (Magic 0xA5)
   - Command 0x11: 48-byte servo target pulse/angle report (Magic 0xB5)
+  - Diagnostic heartbeat and exception guards to isolate runtime crashes
 """
 
 from machine import ADC, PWM, Pin, mem32
 from time import ticks_add, ticks_diff, ticks_us, ticks_ms
 import gc
+import sys
+import micropython
+
+micropython.alloc_emergency_exception_buf(100)
 
 # ---------------------------------------------------------------------------
 # Hardware configuration
@@ -383,6 +388,16 @@ reply_err = bytearray((0xEE,))
 reply = reply_err
 reply_index = 0
 
+# Diagnostic counters
+stats_writes_ok = 0
+stats_writes_bad = 0
+stats_reads_ok = 0
+stats_overflow = 0
+stats_exc_i2c = 0
+stats_exc_adc = 0
+loop_worst_gap_us = 0
+last_loop_us = ticks_us()
+
 
 def set_reply(data):
     global reply, reply_index
@@ -390,7 +405,14 @@ def set_reply(data):
     reply_index = 0
 
 
+def safe_collect():
+    """Run GC only at chosen idle moments outside active transactions."""
+    gc.collect()
+
+
 def process_command(length):
+    global stats_writes_ok, stats_writes_bad
+
     if length == 0:
         return
 
@@ -400,14 +422,20 @@ def process_command(length):
         pulse_us = (rx_buffer[2] << 8) | rx_buffer[3]
         ok = set_servo(rx_buffer[1], pulse_us)
         set_reply(reply_ok if ok else reply_err)
+        if ok:
+            stats_writes_ok += 1
+        else:
+            stats_writes_bad += 1
 
     elif cmd == CMD_SET_ALL and length >= 3:
         set_all_servos((rx_buffer[1] << 8) | rx_buffer[2])
         set_reply(reply_ok)
+        stats_writes_ok += 1
 
     elif cmd == CMD_SAFE:
         reset_to_starting_angles()
         set_reply(reply_ok)
+        stats_writes_ok += 1
 
     elif cmd == CMD_READ_ADC_REPORT:
         set_reply(adc_report)
@@ -420,7 +448,7 @@ def process_command(length):
 
 
 def i2c_tick():
-    global rx_len, rx_overflow, reply_index
+    global rx_len, rx_overflow, reply_index, stats_overflow, stats_reads_ok
 
     state = slave.handle_event()
 
@@ -448,16 +476,64 @@ def i2c_tick():
         if rx_len:
             if rx_overflow:
                 set_reply(reply_err)
+                stats_overflow += 1
             else:
                 process_command(rx_len)
             rx_len = 0
             rx_overflow = False
+            safe_collect()
+
+
+HEARTBEAT_MS = 2000
+next_heartbeat_ms = ticks_add(ticks_ms(), HEARTBEAT_MS)
+
+
+def heartbeat():
+    global next_heartbeat_ms, loop_worst_gap_us
+    now_ms = ticks_ms()
+    if ticks_diff(now_ms, next_heartbeat_ms) < 0:
+        return
+    next_heartbeat_ms = ticks_add(now_ms, HEARTBEAT_MS)
+
+    free = gc.mem_free()
+    alloc = gc.mem_alloc()
+    print(
+        "[hb] free={} alloc={} | writes ok={} bad={} | reads ok={} | "
+        "overflow={} | gap_us={} | exc i2c={} adc={}".format(
+            free,
+            alloc,
+            stats_writes_ok,
+            stats_writes_bad,
+            stats_reads_ok,
+            stats_overflow,
+            loop_worst_gap_us,
+            stats_exc_i2c,
+            stats_exc_adc,
+        )
+    )
+    loop_worst_gap_us = 0
 
 
 print("RP2040 servo slave ready: I2C0 GP20/GP21, address 0x2A")
-try:
-    while True:
+while True:
+    now_us = ticks_us()
+    gap = ticks_diff(now_us, last_loop_us)
+    last_loop_us = now_us
+    if gap > loop_worst_gap_us:
+        loop_worst_gap_us = gap
+
+    try:
         i2c_tick()
+    except Exception as e:
+        stats_exc_i2c += 1
+        print("!! i2c_tick exception:", e)
+        sys.print_exception(e)
+
+    try:
         adc_scan_tick()
-except KeyboardInterrupt:
-    print("RP2040 slave stopped.")
+    except Exception as e:
+        stats_exc_adc += 1
+        print("!! adc_scan_tick exception:", e)
+        sys.print_exception(e)
+
+    heartbeat()
